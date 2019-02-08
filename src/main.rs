@@ -3,6 +3,7 @@ extern crate pcap;
 extern crate etherparse;
 
 use pcap::Device;
+use etherparse::SlicedPacket;
 
 fn main() {
     println!("Start");
@@ -26,6 +27,17 @@ fn main() {
 
     while let Ok(packet) = cap.next() {
         println!("received packet! {:?}", packet);
+        //let layers = SlicedPacket::from_ethernet(&packet);
+
+        match SlicedPacket::from_ethernet(&packet) {
+            Err(err) => println!("Err {:?}", err),
+            Ok(layers) => {
+                println!("ip: {:?}", layers.ip);
+                println!("transport: {:?}", layers.transport);
+                let tcp = layers.transport;
+                println!("derp: {:?}", tcp);
+            }
+        }
     }
     println!("Finish");
 }
