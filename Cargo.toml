@@ -7,4 +7,4 @@ edition = "2018"
 [dependencies]
 pcap = { version = "0.7", features = ["tokio"] }
 ctrlc = { version = "3.0", features = ["termination"] }
-pnet = { version = "0.21.0" }
+etherparse = { version = "0.8.0" }

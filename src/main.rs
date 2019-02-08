@@ -1,5 +1,6 @@
-extern crate pcap;
 extern crate ctrlc;
+extern crate pcap;
+extern crate etherparse;
 
 use pcap::Device;
 
@@ -16,7 +17,6 @@ fn main() {
     //        ' and (tcp[tcpflags] & tcp-fin != 1) and (tcp[tcpflags] & tcp-rst != 1)'
     //ACK == 1 && RST == 0 && SYN == 0 && FIN == 0
     //Must accept TCP fragments
-
 
     let mut cap = Device::lookup().unwrap().open().unwrap();
     match cap.filter(bpf_hello_4){
