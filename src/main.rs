@@ -27,16 +27,22 @@ fn main() {
 
     while let Ok(packet) = cap.next() {
         println!("received packet! {:?}", packet);
-        //let layers = SlicedPacket::from_ethernet(&packet);
 
-        match SlicedPacket::from_ethernet(&packet) {
-            Err(err) => println!("Err {:?}", err),
+        let pkt: SlicedPacket = match SlicedPacket::from_ethernet(&packet) {
+            Err(_err) => {
+                panic!("Cannot parse pkt");
+            }
             Ok(layers) => {
+                println!("link: {:?}", layers.link);
+                println!("vlan: {:?}", layers.vlan);
                 println!("ip: {:?}", layers.ip);
                 println!("transport: {:?}", layers.transport);
-                let tcp = layers.transport;
-                println!("derp: {:?}", tcp);
+                layers
             }
+        };
+        println!("tcp_off: {:?}", pkt.payload);
+        for ii in pkt.payload {
+            println!("{:x}", ii);
         }
     }
     println!("Finish");
