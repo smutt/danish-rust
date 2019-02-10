@@ -4,6 +4,10 @@ extern crate etherparse;
 
 use pcap::Device;
 use etherparse::SlicedPacket;
+use etherparse::PacketHeaders;
+//use etherparse::Ipv4Header;
+//use etherparse::TransportHeader;
+//use etherparse::TcpHeader;
 
 fn main() {
     println!("Start");
@@ -28,9 +32,10 @@ fn main() {
     while let Ok(packet) = cap.next() {
         println!("received packet! {:?}", packet);
 
-        let pkt: SlicedPacket = match SlicedPacket::from_ethernet(&packet) {
+        // Look into PacketHeaders instead of slices
+        let slices: SlicedPacket = match SlicedPacket::from_ethernet(&packet) {
             Err(_err) => {
-                panic!("Cannot parse pkt");
+                panic!("Cannot parse pkt"); // TODO: Need to do better than this 
             }
             Ok(layers) => {
                 println!("link: {:?}", layers.link);
@@ -40,10 +45,28 @@ fn main() {
                 layers
             }
         };
-        println!("tcp_off: {:?}", pkt.payload);
-        for ii in pkt.payload {
+
+        // We should probably not assume that payload == tcp.data
+        println!("payload: {:?}", slices.payload);
+        for ii in slices.payload {
             println!("{:x}", ii);
         }
+
+        let pkt = PacketHeaders::from_ethernet_slice(&packet)
+            .expect("Failed to decode the packet");
+
+        println!("Everything: {:?}", pkt);
+        println!("etype: {:?}", pkt.link.unwrap().ether_type);
+        use etherparse::IpHeader::Version4;
+        use etherparse::IpHeader::Version6;
+        match pkt.ip.unwrap() {
+            Version4(ref value) => println!("proto: {:?}", value.protocol),
+            Version6(ref value) => println!("hlimit: {:?}", value.hop_limit)
+        }
+        //println!("ip.ttl: {:?}", pkt.ip.IpHeader.time_to_live);
+        println!("transport: {:?}", pkt.transport.unwrap());
+        //println!("src_port: {:?}", pkt.transport.src_port);
+        //println!("offset: {:?}", TcpHeader::data_offset(&pkt.transport.tcp()));
     }
     println!("Finish");
 }
