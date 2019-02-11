@@ -8,3 +8,4 @@ edition = "2018"
 pcap = { version = "0.7", features = ["tokio"] }
 ctrlc = { version = "3.0", features = ["termination"] }
 etherparse = { version = "0.8.0" }
+iptables = { version = "0.2" }

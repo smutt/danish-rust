@@ -5,9 +5,9 @@ extern crate etherparse;
 use pcap::Device;
 use etherparse::SlicedPacket;
 use etherparse::PacketHeaders;
-//use etherparse::Ipv4Header;
-//use etherparse::TransportHeader;
-//use etherparse::TcpHeader;
+use etherparse::IpHeader::*;
+use etherparse::TransportHeader::*;
+use iptables;
 
 fn main() {
     println!("Start");
@@ -46,27 +46,24 @@ fn main() {
             }
         };
 
-        // We should probably not assume that payload == tcp.data
         println!("payload: {:?}", slices.payload);
         for ii in slices.payload {
             println!("{:x}", ii);
         }
 
         let pkt = PacketHeaders::from_ethernet_slice(&packet)
-            .expect("Failed to decode the packet");
+            .expect("Failed to decode packet");
 
         println!("Everything: {:?}", pkt);
         println!("etype: {:?}", pkt.link.unwrap().ether_type);
-        use etherparse::IpHeader::Version4;
-        use etherparse::IpHeader::Version6;
         match pkt.ip.unwrap() {
             Version4(ref value) => println!("proto: {:?}", value.protocol),
-            Version6(ref value) => println!("hlimit: {:?}", value.hop_limit)
+            Version6(ref _value) => panic!("IPv6 not yet implemented")
         }
-        //println!("ip.ttl: {:?}", pkt.ip.IpHeader.time_to_live);
-        println!("transport: {:?}", pkt.transport.unwrap());
-        //println!("src_port: {:?}", pkt.transport.src_port);
-        //println!("offset: {:?}", TcpHeader::data_offset(&pkt.transport.tcp()));
+        match pkt.transport.unwrap() {
+            Udp(ref _value) => panic!("UDP transport when TCP expected"),
+            Tcp(ref value) => println!("tcp_src_port: {:?}", value.source_port)
+        }
     }
     println!("Finish");
 }
