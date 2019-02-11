@@ -3,11 +3,11 @@ extern crate pcap;
 extern crate etherparse;
 
 use pcap::Device;
-use etherparse::SlicedPacket;
+//use etherparse::SlicedPacket;
 use etherparse::PacketHeaders;
 use etherparse::IpHeader::*;
 use etherparse::TransportHeader::*;
-use iptables;
+//use iptables;
 
 fn main() {
     println!("Start");
@@ -30,39 +30,38 @@ fn main() {
     }
 
     while let Ok(packet) = cap.next() {
-        println!("received packet! {:?}", packet);
-
-        // Look into PacketHeaders instead of slices
-        let slices: SlicedPacket = match SlicedPacket::from_ethernet(&packet) {
-            Err(_err) => {
-                panic!("Cannot parse pkt"); // TODO: Need to do better than this 
-            }
-            Ok(layers) => {
-                println!("link: {:?}", layers.link);
-                println!("vlan: {:?}", layers.vlan);
-                println!("ip: {:?}", layers.ip);
-                println!("transport: {:?}", layers.transport);
-                layers
-            }
-        };
-
-        println!("payload: {:?}", slices.payload);
-        for ii in slices.payload {
-            println!("{:x}", ii);
-        }
+        //println!("received packet! {:?}", packet);
 
         let pkt = PacketHeaders::from_ethernet_slice(&packet)
             .expect("Failed to decode packet");
 
+        let ip_src: [u8;4];
+        let ip_dst: [u8;4];
+        let tcp_port: u16;
+
         println!("Everything: {:?}", pkt);
-        println!("etype: {:?}", pkt.link.unwrap().ether_type);
         match pkt.ip.unwrap() {
-            Version4(ref value) => println!("proto: {:?}", value.protocol),
-            Version6(ref _value) => panic!("IPv6 not yet implemented")
+            Version6(ref _value) => panic!("IPv6 not yet implemented"),
+            Version4(ref value) => {
+                ip_src = value.source;
+                ip_dst = value.destination;
+            }
         }
         match pkt.transport.unwrap() {
             Udp(ref _value) => panic!("UDP transport when TCP expected"),
-            Tcp(ref value) => println!("tcp_src_port: {:?}", value.source_port)
+            Tcp(ref value) => {
+                tcp_port = value.source_port;
+                match parse_sni(pkt.payload) {
+                    Err(_err) => panic!("Cannot parse SNI"), // TODO: Need to do better than this 
+                    Ok(sni) => {
+                        println!("IP_src: {:?}", ip_src);
+                        println!("IP_dst: {:?}", ip_dst);
+                        println!("tcp_port: {:?}", tcp_port);
+                        println!("sni: {:?}", sni);
+                        // Here is where we create the cache entry
+                    }
+                }
+            }
         }
     }
     println!("Finish");
@@ -72,4 +71,17 @@ fn main() {
 fn euthanize() {
     println!("Ctrl-C exiting");
     std::process::exit(0);
+}
+
+// Parse out the SNI from passed payload
+fn parse_sni(payload: &[u8]) -> Result<(&str), ParseError> {
+    println!("first_byte: {:?}", payload[0]);
+    Ok("derps")
+}
+
+///Errors in the given data, placeholder for now
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum ParseError {
+    Foo(usize),
+    Bar(usize),
 }

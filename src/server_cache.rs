@@ -1,14 +1,15 @@
 use std::collections::HashMap;
 
 pub struct ServerCache {
-    cache: HashMap,
+    cache: HashMap
 }
 
 // Danish server cache entry for IPv4, IPv6 not yet implemented
 #[derive(Clone)]
 pub struct CacheEntry {
-    sni: String
-    tcp_port: u8,
+    ts: u8, // insert timestamp
+    sni: str,
+    tcp_port: u16,
     ip_src: [u8;4],
     ip_dst: [u8;4],
     seq: u8,
