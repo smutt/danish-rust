@@ -1,12 +1,17 @@
 extern crate ctrlc;
 extern crate pcap;
 extern crate etherparse;
+extern crate nom;
+extern crate tls_parser;
 
 use pcap::Device;
 //use etherparse::SlicedPacket;
 use etherparse::PacketHeaders;
 use etherparse::IpHeader::*;
 use etherparse::TransportHeader::*;
+use nom::IResult;
+use tls_parser::tls;
+//use tls_parser::tls_extensions;
 //use iptables;
 
 fn main() {
@@ -47,16 +52,17 @@ fn main() {
                 ip_dst = value.destination;
             }
         }
+        println!("IP_src: {:?}", ip_src);
+        println!("IP_dst: {:?}", ip_dst);
+
         match pkt.transport.unwrap() {
             Udp(ref _value) => panic!("UDP transport when TCP expected"),
             Tcp(ref value) => {
                 tcp_port = value.source_port;
+                println!("tcp_port: {:?}", tcp_port);
                 match parse_sni(pkt.payload) {
                     Err(_err) => panic!("Cannot parse SNI"), // TODO: Need to do better than this 
                     Ok(sni) => {
-                        println!("IP_src: {:?}", ip_src);
-                        println!("IP_dst: {:?}", ip_dst);
-                        println!("tcp_port: {:?}", tcp_port);
                         println!("sni: {:?}", sni);
                         // Here is where we create the cache entry
                     }
@@ -75,7 +81,16 @@ fn euthanize() {
 
 // Parse out the SNI from passed payload
 fn parse_sni(payload: &[u8]) -> Result<(&str), ParseError> {
-    println!("first_byte: {:?}", payload[0]);
+    //println!("\npayload: {:?}", payload);
+    //println!("\ntls: {:?}", tls::parse_tls_plaintext(payload));
+    match tls::parse_tls_plaintext(payload) {
+	      IResult::Done(_remain, record) => {
+            println!("tls: {:?}", record);
+	      },
+	      IResult::Incomplete(_) => panic!("Defragmentation required (TLS record)"),
+	      IResult::Error(e) => panic!("parse_tls_record_with_header failed: {:?}",e),
+
+    }
     Ok("derps")
 }
 
