@@ -9,7 +9,7 @@ use pcap::Device;
 use etherparse::PacketHeaders;
 use etherparse::IpHeader::*;
 use etherparse::TransportHeader::*;
-use nom::IResult;
+//use nom::IResult;
 use tls_parser::tls;
 //use tls_parser::tls_extensions;
 //use iptables;
@@ -82,13 +82,13 @@ fn euthanize() {
 // Parse out the SNI from passed payload
 fn parse_sni(payload: &[u8]) -> Result<(&str), ParseError> {
     //println!("\npayload: {:?}", payload);
-    //println!("\ntls: {:?}", tls::parse_tls_plaintext(payload));
     match tls::parse_tls_plaintext(payload) {
-	      IResult::Done(_remain, record) => {
-            println!("tls: {:?}", record);
-	      },
-	      IResult::Incomplete(_) => panic!("Defragmentation required (TLS record)"),
-	      IResult::Error(e) => panic!("parse_tls_record_with_header failed: {:?}",e),
+        Err(_) => (),
+        Ok(value) => {
+            println!("\nvalue: {:?}", value);
+            println!("\nmsg: {:?}", value.1.msg);
+            println!("\next: {:?}", value.1.msg);
+        }
 
     }
     Ok("derps")
