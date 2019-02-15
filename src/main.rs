@@ -11,7 +11,7 @@ use etherparse::IpHeader::*;
 use etherparse::TransportHeader::*;
 //use nom::IResult;
 use tls_parser::tls;
-//use tls_parser::tls_extensions;
+use tls_parser::tls_extensions;
 //use iptables;
 
 fn main() {
@@ -56,7 +56,7 @@ fn main() {
         println!("IP_dst: {:?}", ip_dst);
 
         match pkt.transport.unwrap() {
-            Udp(ref _value) => panic!("UDP transport when TCP expected"),
+            Udp(ref _value) => panic!("UDP transport captured when TCP expected"),
             Tcp(ref value) => {
                 tcp_port = value.source_port;
                 println!("tcp_port: {:?}", tcp_port);
@@ -87,9 +87,35 @@ fn parse_sni(payload: &[u8]) -> Result<(&str), ParseError> {
         Ok(value) => {
             println!("\nvalue: {:?}", value);
             println!("\nmsg: {:?}", value.1.msg);
-            println!("\next: {:?}", value.1.msg);
+            println!("\next: {:?}", value.1.msg[0]);
+            match value.1.msg[0] {
+                tls::TlsMessage::Handshake(ref handshake) => {
+                    println!("\nhandshake: {:?}", handshake);
+                    match handshake {
+                        tls::TlsMessageHandshake::ClientHello(ref ch) => {
+                            println!("\nch: {:?}", ch);
+                            //println!("\nch.ext: {:?}", ch.ext.unwrap());
+                            match tls_extensions::parse_tls_extensions(ch.ext.unwrap()) {
+                                Err(_) => (),
+                                Ok(extensions) => {
+                                    println!("\nexts: {:?}", extensions.1);
+                                    for ext in extensions.1.iter() {
+                                        match ext {
+                                            tls_extensions::TlsExtension::SNI(ref sni) => {
+                                                println!("\nsni: {:?}", sni);
+                                            }
+                                            _ => (),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => println!("TLS ClientHello not found in handshake msg"),
+                    }
+                }
+                _ => println!("Incorrect TLS msg type"),
+            }
         }
-
     }
     Ok("derps")
 }
