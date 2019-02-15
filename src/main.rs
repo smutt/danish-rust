@@ -80,7 +80,7 @@ fn euthanize() {
 }
 
 // Parse out the SNI from passed payload
-fn parse_sni(payload: &[u8]) -> Result<(&str), ParseError> {
+fn parse_sni(payload: &[u8]) -> Result<&String, &str> {
     //println!("\npayload: {:?}", payload);
     match tls::parse_tls_plaintext(payload) {
         Err(_) => (),
@@ -94,15 +94,18 @@ fn parse_sni(payload: &[u8]) -> Result<(&str), ParseError> {
                     match handshake {
                         tls::TlsMessageHandshake::ClientHello(ref ch) => {
                             println!("\nch: {:?}", ch);
-                            //println!("\nch.ext: {:?}", ch.ext.unwrap());
                             match tls_extensions::parse_tls_extensions(ch.ext.unwrap()) {
                                 Err(_) => (),
                                 Ok(extensions) => {
                                     println!("\nexts: {:?}", extensions.1);
                                     for ext in extensions.1.iter() {
+                                        println!("\next: {:?}", ext);
                                         match ext {
-                                            tls_extensions::TlsExtension::SNI(ref sni) => {
+                                            tls_extensions::TlsExtension::SNI(sni) => {
                                                 println!("\nsni: {:?}", sni);
+                                                let rv = String::from_utf8(sni[0].1.to_vec()).unwrap();
+                                                println!("\nrv: {:?}", rv);
+                                                return Ok(&rv);
                                             }
                                             _ => (),
                                         }
@@ -117,12 +120,14 @@ fn parse_sni(payload: &[u8]) -> Result<(&str), ParseError> {
             }
         }
     }
-    Ok("derps")
+    Err("Pwoblem")
 }
 
+/*
 ///Errors in the given data, placeholder for now
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ParseError {
     Foo(usize),
     Bar(usize),
 }
+*/
