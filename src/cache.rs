@@ -1,5 +1,9 @@
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Cache {
+pub struct Cache {
     Client(ClientCache),
     Server(ServerCache)
 }
+
+
+
+

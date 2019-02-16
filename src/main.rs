@@ -3,6 +3,7 @@ extern crate pcap;
 extern crate etherparse;
 extern crate tls_parser;
 
+use std::collections::HashMap;
 use pcap::Device;
 //use etherparse::SlicedPacket;
 use etherparse::PacketHeaders;
@@ -12,8 +13,25 @@ use tls_parser::tls;
 use tls_parser::tls_extensions;
 //use iptables;
 
+#[allow(dead_code)]
+struct ClientCacheEntry {
+    ts: u8,
+}
+
+#[allow(dead_code)]
+struct ServerCacheEntry<'a> {
+    ts: u8,
+    seq: u8,
+    data: &'a[u8],
+}
+
 fn main() {
     println!("Start");
+
+    // Setup our cache
+    //let mut ClientCache: HashMap<String, ClientCacheEntry>;
+    let mut client_cache = HashMap::new();
+    let mut _server_cache: HashMap<String, ServerCacheEntry>;
 
     ctrlc::set_handler(move || {
         euthanize();
@@ -62,7 +80,8 @@ fn main() {
                     Err(_err) => panic!("Cannot parse SNI"), // TODO: Need to do better than this 
                     Ok(sni) => {
                         println!("sni: {:?}", sni);
-                        // Here is where we create the cache entry
+                        client_cache.insert(derive_cache_key(sni, tcp_port, ip_src, ip_dst), ClientCacheEntry { ts: 0 });
+                        //println!("client_cache: {:?}", client_cache);
                     }
                 }
             }
@@ -108,4 +127,10 @@ fn parse_sni(payload: &[u8]) -> Result<String, &str> {
         }
     }
     Err("parse_sni: General error")
+}
+
+// Derives a cache key from unique pairing of values
+fn derive_cache_key(sni: String, port: u16, ip_src: [u8;4], ip_dst: [u8;4]) -> String {
+    println!("\n {:?} {:?} {:?} {:?}", sni, port, ip_src, ip_dst);
+    "derps".to_string()
 }

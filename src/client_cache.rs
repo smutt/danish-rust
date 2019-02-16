@@ -15,7 +15,7 @@ pub struct CacheEntry {
 }
 
 impl ClientCache {
-    ///Constructs a ClientCache
+    //Constructs a ClientCache
     pub fn new() {
 
     }

@@ -16,7 +16,7 @@ pub struct CacheEntry {
 }
 
 impl ServerCache {
-    ///Constructs a ServerCache
+    //Constructs a ServerCache
     pub fn new() {
 
     }
