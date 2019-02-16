@@ -99,7 +99,6 @@ fn euthanize() {
 // Parse out the SNI from passed TLS payload
 fn parse_sni(payload: &[u8]) -> Result<String, &str> {
     match tls::parse_tls_plaintext(payload) {
-        Err(_) => (),
         Ok(value) => {
             match value.1.msg[0] {
                 tls::TlsMessage::Handshake(ref handshake) => {
@@ -125,6 +124,7 @@ fn parse_sni(payload: &[u8]) -> Result<String, &str> {
                 _ => return Err("parse_sni: Incorrect TLS msg type"),
             }
         }
+        _ => return Err("parse_sni: Error parsing plaintext TLS payload"),
     }
     Err("parse_sni: General error")
 }
