@@ -1,7 +1,6 @@
 extern crate ctrlc;
 extern crate pcap;
 extern crate etherparse;
-extern crate nom;
 extern crate tls_parser;
 
 use pcap::Device;
@@ -9,7 +8,6 @@ use pcap::Device;
 use etherparse::PacketHeaders;
 use etherparse::IpHeader::*;
 use etherparse::TransportHeader::*;
-//use nom::IResult;
 use tls_parser::tls;
 use tls_parser::tls_extensions;
 //use iptables;
