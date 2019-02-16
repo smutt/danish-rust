@@ -79,55 +79,35 @@ fn euthanize() {
     std::process::exit(0);
 }
 
-// Parse out the SNI from passed payload
-fn parse_sni(payload: &[u8]) -> Result<&String, &str> {
-    //println!("\npayload: {:?}", payload);
+// Parse out the SNI from passed TLS payload
+fn parse_sni(payload: &[u8]) -> Result<String, &str> {
     match tls::parse_tls_plaintext(payload) {
         Err(_) => (),
         Ok(value) => {
-            println!("\nvalue: {:?}", value);
-            println!("\nmsg: {:?}", value.1.msg);
-            println!("\next: {:?}", value.1.msg[0]);
             match value.1.msg[0] {
                 tls::TlsMessage::Handshake(ref handshake) => {
-                    println!("\nhandshake: {:?}", handshake);
                     match handshake {
                         tls::TlsMessageHandshake::ClientHello(ref ch) => {
-                            println!("\nch: {:?}", ch);
                             match tls_extensions::parse_tls_extensions(ch.ext.unwrap()) {
-                                Err(_) => (),
                                 Ok(extensions) => {
-                                    println!("\nexts: {:?}", extensions.1);
                                     for ext in extensions.1.iter() {
-                                        println!("\next: {:?}", ext);
                                         match ext {
                                             tls_extensions::TlsExtension::SNI(sni) => {
-                                                println!("\nsni: {:?}", sni);
-                                                let rv = String::from_utf8(sni[0].1.to_vec()).unwrap();
-                                                println!("\nrv: {:?}", rv);
-                                                return Ok(&rv);
+                                                return Ok(String::from_utf8(sni[0].1.to_vec()).unwrap());
                                             }
                                             _ => (),
                                         }
                                     }
                                 }
+                                _ => return Err("parse_sni: Error parsing TLS extensions"),
                             }
                         }
-                        _ => println!("TLS ClientHello not found in handshake msg"),
+                        _ => return Err("parse_sni: TLS ClientHello not found in handshake msg"),
                     }
                 }
-                _ => println!("Incorrect TLS msg type"),
+                _ => return Err("parse_sni: Incorrect TLS msg type"),
             }
         }
     }
-    Err("Pwoblem")
+    Err("parse_sni: General error")
 }
-
-/*
-///Errors in the given data, placeholder for now
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum ParseError {
-    Foo(usize),
-    Bar(usize),
-}
-*/
