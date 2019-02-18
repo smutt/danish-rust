@@ -17,13 +17,14 @@ use tls_parser::tls_extensions;
 #[allow(dead_code)]
 struct ClientCacheEntry {
     ts: SystemTime,
+    sni: String,
 }
 
 #[allow(dead_code)]
 struct ServerCacheEntry<'a> {
     ts: SystemTime,
     seq: u8,
-    data: &'a[u8],
+    data: &'a[u8], // TCP fragment for reassembly
 }
 
 fn main() {
@@ -31,26 +32,32 @@ fn main() {
 
     // Setup our cache
     let mut client_cache = HashMap::new();
-    let mut _server_cache: HashMap<String, ServerCacheEntry>;
+    let mut server_cache = HashMap::new();
 
     ctrlc::set_handler(move || {
         euthanize();
     }).expect("Error setting Ctrl-C handler");
 
     // http://serverfault.com/questions/574405/tcpdump-server-hello-certificate-filter
-    let bpf_hello_4 = "(tcp[((tcp[12:1] & 0xf0) >> 2)+5:1] = 0x01) and (tcp[((tcp[12:1] & 0xf0) >> 2):1] = 0x16) and (dst port 443)";
-    //   BPF_REPLY_4 = 'tcp and src port 443 and (tcp[tcpflags] & tcp-ack = 16) and (tcp[tcpflags] & tcp-syn != 2)' \
-    //        ' and (tcp[tcpflags] & tcp-fin != 1) and (tcp[tcpflags] & tcp-rst != 1)'
+    let bpf_client_4 = "(tcp[((tcp[12:1] & 0xf0) >> 2)+5:1] = 0x01) and (tcp[((tcp[12:1] & 0xf0) >> 2):1] = 0x16) and (dst port 443)";
+    let bpf_server_4 = "tcp and src port 443 and (tcp[tcpflags] & tcp-ack = 16) and (tcp[tcpflags] & tcp-syn != 2) and 
+        (tcp[tcpflags] & tcp-fin != 1) and (tcp[tcpflags] & tcp-rst != 1)";
     //ACK == 1 && RST == 0 && SYN == 0 && FIN == 0
     //Must accept TCP fragments
 
-    let mut cap = Device::lookup().unwrap().open().unwrap();
-    match cap.filter(bpf_hello_4){
+    let mut client_cap = Device::lookup().unwrap().open().unwrap();
+    match client_cap.filter(bpf_client_4){
         Ok(_) => (),
         Err(err) => println!("BPF error {}", err.to_string()),
     }
 
-    while let Ok(packet) = cap.next() {
+    let mut server_cap = Device::lookup().unwrap().open().unwrap();
+    match server_cap.filter(bpf_server_4){
+        Ok(_) => (),
+        Err(err) => println!("BPF error {}", err.to_string()),
+    }
+
+    while let Ok(packet) = client_cap.next() {
         //println!("received packet! {:?}", packet);
 
         let pkt = PacketHeaders::from_ethernet_slice(&packet)
@@ -80,7 +87,55 @@ fn main() {
                     Err(_err) => panic!("Cannot parse SNI"), // TODO: Need to do better than this 
                     Ok(sni) => {
                         println!("sni: {:?}", sni);
-                        client_cache.insert(derive_cache_key(sni, tcp_port, ip_src, ip_dst), ClientCacheEntry { ts: SystemTime::now() });
+                        println!("Inserting client_cache key: {:?}", derive_cache_key(&ip_src, &ip_dst, &tcp_port));
+                        client_cache.insert(derive_cache_key(&ip_src, &ip_dst, &tcp_port), ClientCacheEntry {
+                            ts: SystemTime::now(),
+                            sni: sni,
+                        });
+
+
+                        while let Ok(resp_packet) = server_cap.next() {
+                            //println!("resp_packet! {:?}", resp_packet);
+                            let resp_pkt = PacketHeaders::from_ethernet_slice(&resp_packet)
+                                .expect("Failed to decode resp_packet");
+                            //println!("Everything: {:?}", resp_pkt);
+
+                            let resp_ip_src: [u8;4];
+                            let resp_ip_dst: [u8;4];
+                            let resp_tcp_port: u16;
+
+                            match resp_pkt.ip.unwrap() {
+                                Version6(ref _value) => panic!("IPv6 not yet implemented"),
+                                Version4(ref value) => {
+                                    resp_ip_src = value.source;
+                                    resp_ip_dst = value.destination;
+                                }
+                            }
+                            println!("resp_IP_src: {:?}", resp_ip_src);
+                            println!("resp_IP_dst: {:?}", resp_ip_dst);
+
+                            match resp_pkt.transport.unwrap() {
+                                Udp(ref _value) => panic!("UDP transport captured when TCP expected"),
+                                Tcp(ref value) => {
+                                    resp_tcp_port = value.destination_port;
+                                    println!("resp_tcp_port: {:?}", resp_tcp_port);
+                                    let key = derive_cache_key(&resp_ip_dst, &resp_ip_src, &resp_tcp_port);
+                                    if client_cache.contains_key(&key) {
+                                        println!("Found key {:?}", key);
+                                        if server_cache.contains_key(&key) {
+                                            println!("TODO");
+                                        }else{
+                                            server_cache.insert(key, ServerCacheEntry {
+                                                ts: SystemTime::now(),
+                                                seq: 0,
+                                                data: &[0, 1, 3, 4],
+                                                //data: &resp_pkt.payload.clone(),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -129,20 +184,17 @@ fn parse_sni(payload: &[u8]) -> Result<String, &str> {
 }
 
 // Derives a cache key from unique pairing of values
-fn derive_cache_key(sni: String, port: u16, ip_src: [u8;4], ip_dst: [u8;4]) -> String {
+fn derive_cache_key(src: &[u8;4], dst: &[u8;4], port: &u16) -> String {
     let delim = "_".to_string();
-    let mut k = "".to_string();
-    k.push_str(&sni);
-    k.push_str(&delim);
-    k.push_str(&port.to_string());
-
-    for n in ip_src.iter() {
-        k.push_str(&delim);
-        k.push_str(&n.to_string());
+    let mut key = "".to_string();
+    for n in src.iter() {
+        key.push_str(&n.to_string());
+        key.push_str(&delim);
     }
-    for n in ip_dst.iter() {
-        k.push_str(&delim);
-        k.push_str(&n.to_string());
+    for n in dst.iter() {
+        key.push_str(&n.to_string());
+        key.push_str(&delim);
     }
-    k
+    key.push_str(&port.to_string());
+    key
 }
