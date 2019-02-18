@@ -30,7 +30,6 @@ fn main() {
     println!("Start");
 
     // Setup our cache
-    //let mut ClientCache: HashMap<String, ClientCacheEntry>;
     let mut client_cache = HashMap::new();
     let mut _server_cache: HashMap<String, ServerCacheEntry>;
 
@@ -131,15 +130,19 @@ fn parse_sni(payload: &[u8]) -> Result<String, &str> {
 
 // Derives a cache key from unique pairing of values
 fn derive_cache_key(sni: String, port: u16, ip_src: [u8;4], ip_dst: [u8;4]) -> String {
-    println!("\n {:?} {:?} {:?} {:?}", sni, port.to_string(), ip_src, ip_dst);
     let delim = "_".to_string();
     let mut k = "".to_string();
     k.push_str(&sni);
     k.push_str(&delim);
     k.push_str(&port.to_string());
-    k.push_str(&delim);
-    //k.push_str(ip_src.into_iter().map(|x| x.to_string()).collect());
-    println!("k: {:?}", k);
 
-    "derps".to_string()
+    for n in ip_src.iter() {
+        k.push_str(&delim);
+        k.push_str(&n.to_string());
+    }
+    for n in ip_dst.iter() {
+        k.push_str(&delim);
+        k.push_str(&n.to_string());
+    }
+    k
 }
