@@ -4,6 +4,7 @@ extern crate etherparse;
 extern crate tls_parser;
 
 use std::collections::HashMap;
+use std::time::SystemTime;
 use pcap::Device;
 //use etherparse::SlicedPacket;
 use etherparse::PacketHeaders;
@@ -15,12 +16,12 @@ use tls_parser::tls_extensions;
 
 #[allow(dead_code)]
 struct ClientCacheEntry {
-    ts: u8,
+    ts: SystemTime,
 }
 
 #[allow(dead_code)]
 struct ServerCacheEntry<'a> {
-    ts: u8,
+    ts: SystemTime,
     seq: u8,
     data: &'a[u8],
 }
@@ -80,8 +81,7 @@ fn main() {
                     Err(_err) => panic!("Cannot parse SNI"), // TODO: Need to do better than this 
                     Ok(sni) => {
                         println!("sni: {:?}", sni);
-                        client_cache.insert(derive_cache_key(sni, tcp_port, ip_src, ip_dst), ClientCacheEntry { ts: 0 });
-                        //println!("client_cache: {:?}", client_cache);
+                        client_cache.insert(derive_cache_key(sni, tcp_port, ip_src, ip_dst), ClientCacheEntry { ts: SystemTime::now() });
                     }
                 }
             }
@@ -131,6 +131,15 @@ fn parse_sni(payload: &[u8]) -> Result<String, &str> {
 
 // Derives a cache key from unique pairing of values
 fn derive_cache_key(sni: String, port: u16, ip_src: [u8;4], ip_dst: [u8;4]) -> String {
-    println!("\n {:?} {:?} {:?} {:?}", sni, port, ip_src, ip_dst);
+    println!("\n {:?} {:?} {:?} {:?}", sni, port.to_string(), ip_src, ip_dst);
+    let delim = "_".to_string();
+    let mut k = "".to_string();
+    k.push_str(&sni);
+    k.push_str(&delim);
+    k.push_str(&port.to_string());
+    k.push_str(&delim);
+    //k.push_str(ip_src.into_iter().map(|x| x.to_string()).collect());
+    println!("k: {:?}", k);
+
     "derps".to_string()
 }
