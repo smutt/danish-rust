@@ -41,11 +41,11 @@ fn main() {
     }).expect("Error setting Ctrl-C handler");
 
     // http://serverfault.com/questions/574405/tcpdump-server-hello-certificate-filter
+    //ACK == 1 && RST == 0 && SYN == 0 && FIN == 0
+    //Must accept TCP fragments
     let bpf_client_4 = "(tcp[((tcp[12:1] & 0xf0) >> 2)+5:1] = 0x01) and (tcp[((tcp[12:1] & 0xf0) >> 2):1] = 0x16) and (dst port 443)";
     let bpf_server_4 = "tcp and src port 443 and (tcp[tcpflags] & tcp-ack = 16) and (tcp[tcpflags] & tcp-syn != 2) and 
         (tcp[tcpflags] & tcp-fin != 1) and (tcp[tcpflags] & tcp-rst != 1)";
-    //ACK == 1 && RST == 0 && SYN == 0 && FIN == 0
-    //Must accept TCP fragments
 
     let mut client_cap = Device::lookup().unwrap().open().unwrap();
     match client_cap.filter(bpf_client_4){
@@ -70,6 +70,7 @@ fn main() {
         match pkt.ip.unwrap() {
             Version6(_) => panic!("IPv6 not yet implemented"),
             Version4(ref value) => {
+                /* The next match stmt should come here. Will do when we break this out async */
                 ip_src = value.source;
                 ip_dst = value.destination;
             }
@@ -101,6 +102,7 @@ fn main() {
                             match resp_pkt.ip.unwrap() {
                                 Version6(_) => panic!("IPv6 not yet implemented"),
                                 Version4(ref value) => {
+                                    /* The next match stmt should come here. Will do when we break this out async */
                                     resp_ip_src = value.source;
                                     resp_ip_dst = value.destination;
                                 }
@@ -110,23 +112,36 @@ fn main() {
 
                             match resp_pkt.transport.unwrap() {
                                 Udp(_) => println!("UDP transport captured when TCP expected"),
-                                Tcp(ref value) => {
-                                    println!("resp_tcp_seq: {:?}", value.sequence_number);
+                                Tcp(ref tcp) => {
+                                    println!("resp_tcp_seq: {:?}", tcp.sequence_number);
+                                    println!("payload_len: {:?}", resp_pkt.payload.len());
 
-                                    let key = derive_cache_key(&resp_ip_dst, &resp_ip_src, &value.destination_port);
+                                    let key = derive_cache_key(&resp_ip_dst, &resp_ip_src, &tcp.destination_port);
                                     if client_cache.contains_key(&key) {
                                         println!("Found client_cache key {:?}", key);
                                         match server_cache.get(&key) {
                                             Some(ref entry) => {
                                                 println!("Found server_cache key {:?}", key);
                                                 println!("server_cache: {:?}", entry);
+                                                match parse_cert(&resp_pkt.payload) {
+                                                    Ok(cert) => println!("X509_cert: {:?}", cert),
+                                                    Err(err) => {
+                                                        println!("parse_cert_err: {:?}", err);
+                                                        // Update server_cache.get(&key)
+                                                    }
+                                                }
                                             }
                                             _ => {
-                                                server_cache.insert(key, ServerCacheEntry {
-                                                    ts: SystemTime::now(),
-                                                    seq: value.sequence_number,
-                                                    data: resp_pkt.payload.to_vec(),
-                                                });
+                                                match parse_cert(&resp_pkt.payload) {
+                                                    Ok(cert) => println!("X509_cert: {:?}", cert),
+                                                    Err(_) => {
+                                                        server_cache.insert(key, ServerCacheEntry {
+                                                            ts: SystemTime::now(),
+                                                            seq: tcp.sequence_number + resp_pkt.payload.len() as u32,
+                                                            data: resp_pkt.payload.to_vec(),
+                                                        });
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -140,6 +155,18 @@ fn main() {
     }
     println!("Finish");
 }
+
+// Parse the X.509 cert from TLS ServerHello Messages
+fn parse_cert(payload: &[u8]) -> Result<String, &str> {
+   match tls::parse_tls_plaintext(payload) {
+        Ok(value) => {
+            println!("furst: {:?}", value);
+        }
+       _ => return Err("parse_cert: Error parsing plaintext TLS payload"),
+   }
+    Err("parse_cert: General error")
+}
+
 
 // Die gracefully
 fn euthanize() {
