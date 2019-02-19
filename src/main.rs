@@ -60,78 +60,74 @@ fn main() {
     }
 
     while let Ok(packet) = client_cap.next() {
-        //println!("received packet! {:?}", packet);
-
         let pkt = PacketHeaders::from_ethernet_slice(&packet)
             .expect("Failed to decode packet");
+        //println!("Everything: {:?}", pkt);
 
         let ip_src: [u8;4];
         let ip_dst: [u8;4];
-        let tcp_port: u16;
 
-        println!("Everything: {:?}", pkt);
         match pkt.ip.unwrap() {
-            Version6(ref _value) => panic!("IPv6 not yet implemented"),
+            Version6(_) => panic!("IPv6 not yet implemented"),
             Version4(ref value) => {
                 ip_src = value.source;
                 ip_dst = value.destination;
             }
         }
-        println!("IP_src: {:?}", ip_src);
-        println!("IP_dst: {:?}", ip_dst);
+        //println!("IP_src: {:?}", ip_src);
+        //println!("IP_dst: {:?}", ip_dst);
 
         match pkt.transport.unwrap() {
-            Udp(ref _value) => panic!("UDP transport captured when TCP expected"),
+            Udp(_) => println!("UDP transport captured when TCP expected"),
             Tcp(ref value) => {
-                tcp_port = value.source_port;
-                println!("tcp_port: {:?}", tcp_port);
+                //println!("tcp_port: {:?}", tcp_port);
                 match parse_sni(pkt.payload) {
-                    Err(_err) => panic!("Cannot parse SNI"), // TODO: Need to do better than this 
+                    Err(_) => panic!("Cannot parse SNI"),
                     Ok(sni) => {
-                        println!("sni: {:?}", sni);
-                        println!("Inserting client_cache key: {:?}", derive_cache_key(&ip_src, &ip_dst, &tcp_port));
-                        client_cache.insert(derive_cache_key(&ip_src, &ip_dst, &tcp_port), ClientCacheEntry {
+                        println!("Inserting client_cache key: {:?} sni: {:?}", derive_cache_key(&ip_src, &ip_dst, &value.source_port), sni);
+                        client_cache.insert(derive_cache_key(&ip_src, &ip_dst, &value.source_port), ClientCacheEntry {
                             ts: SystemTime::now(),
                             sni: sni,
                         });
 
                         while let Ok(resp_packet) = server_cap.next() {
-                            //println!("resp_packet! {:?}", resp_packet);
                             let resp_pkt = PacketHeaders::from_ethernet_slice(&resp_packet)
                                 .expect("Failed to decode resp_packet");
                             //println!("Everything: {:?}", resp_pkt);
 
                             let resp_ip_src: [u8;4];
                             let resp_ip_dst: [u8;4];
-                            let resp_tcp_port: u16;
 
-                            //let pl = resp_pkt.payload.clone();
                             match resp_pkt.ip.unwrap() {
-                                Version6(ref _value) => panic!("IPv6 not yet implemented"),
+                                Version6(_) => panic!("IPv6 not yet implemented"),
                                 Version4(ref value) => {
                                     resp_ip_src = value.source;
                                     resp_ip_dst = value.destination;
                                 }
                             }
-                            println!("resp_IP_src: {:?}", resp_ip_src);
-                            println!("resp_IP_dst: {:?}", resp_ip_dst);
+                            //println!("resp_IP_src: {:?}", resp_ip_src);
+                            //println!("resp_IP_dst: {:?}", resp_ip_dst);
 
                             match resp_pkt.transport.unwrap() {
-                                Udp(ref _value) => panic!("UDP transport captured when TCP expected"),
+                                Udp(_) => println!("UDP transport captured when TCP expected"),
                                 Tcp(ref value) => {
-                                    resp_tcp_port = value.destination_port;
-                                    println!("resp_tcp_port: {:?}", resp_tcp_port);
-                                    let key = derive_cache_key(&resp_ip_dst, &resp_ip_src, &resp_tcp_port);
+                                    println!("resp_tcp_seq: {:?}", value.sequence_number);
+
+                                    let key = derive_cache_key(&resp_ip_dst, &resp_ip_src, &value.destination_port);
                                     if client_cache.contains_key(&key) {
-                                        println!("Found key {:?}", key);
-                                        if server_cache.contains_key(&key) {
-                                            println!("ASDL: {:?}", server_cache.get(&key).unwrap());
-                                        }else{
-                                            server_cache.insert(key, ServerCacheEntry {
-                                                ts: SystemTime::now(),
-                                                seq: value.sequence_number,
-                                                data: resp_pkt.payload.to_vec(),
-                                            });
+                                        println!("Found client_cache key {:?}", key);
+                                        match server_cache.get(&key) {
+                                            Some(ref entry) => {
+                                                println!("Found server_cache key {:?}", key);
+                                                println!("server_cache: {:?}", entry);
+                                            }
+                                            _ => {
+                                                server_cache.insert(key, ServerCacheEntry {
+                                                    ts: SystemTime::now(),
+                                                    seq: value.sequence_number,
+                                                    data: resp_pkt.payload.to_vec(),
+                                                });
+                                            }
                                         }
                                     }
                                 }
