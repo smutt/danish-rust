@@ -15,18 +15,18 @@ use tls_parser::tls_extensions;
 //use iptables;
 
 #[allow(dead_code)]
+#[derive(Debug)]
 struct ClientCacheEntry {
     ts: SystemTime,
     sni: String,
 }
 
 #[allow(dead_code)]
+#[derive(Debug)]
 struct ServerCacheEntry {
     ts: SystemTime,
-    seq: u8,
+    seq: u32,
     data: Vec<u8>, // TCP fragment for reassembly
-    //data: &'a[u8],
-    //data: [u8; 1500],
 }
 
 fn main() {
@@ -125,22 +125,12 @@ fn main() {
                                     if client_cache.contains_key(&key) {
                                         println!("Found key {:?}", key);
                                         if server_cache.contains_key(&key) {
-                                            /*match server_cache.get(&key) {
-                                                Err(_err) => (),
-                                                Ok(data) => println!("derps: {:?}", data),
-                                            }*/
                                             println!("ASDL: {:?}", server_cache.get(&key).unwrap());
                                         }else{
-                                            println!("payload: {:?}", &resp_pkt.payload);
                                             server_cache.insert(key, ServerCacheEntry {
                                                 ts: SystemTime::now(),
-                                                seq: 0,
-                                                //data: &[0, 1, 3, 4],
-                                                //data: Vec::new().extend(&resp_pkt.payload.iter().cloned()),
-                                                //data: vec![1, 2, 3, 4],
+                                                seq: value.sequence_number,
                                                 data: resp_pkt.payload.to_vec(),
-                                                //data: resp_pkt.payload.clone(),
-
                                             });
                                         }
                                     }
