@@ -21,10 +21,12 @@ struct ClientCacheEntry {
 }
 
 #[allow(dead_code)]
-struct ServerCacheEntry<'a> {
+struct ServerCacheEntry {
     ts: SystemTime,
     seq: u8,
-    data: &'a[u8], // TCP fragment for reassembly
+    data: Vec<u8>, // TCP fragment for reassembly
+    //data: &'a[u8],
+    //data: [u8; 1500],
 }
 
 fn main() {
@@ -93,7 +95,6 @@ fn main() {
                             sni: sni,
                         });
 
-
                         while let Ok(resp_packet) = server_cap.next() {
                             //println!("resp_packet! {:?}", resp_packet);
                             let resp_pkt = PacketHeaders::from_ethernet_slice(&resp_packet)
@@ -104,6 +105,7 @@ fn main() {
                             let resp_ip_dst: [u8;4];
                             let resp_tcp_port: u16;
 
+                            //let pl = resp_pkt.payload.clone();
                             match resp_pkt.ip.unwrap() {
                                 Version6(ref _value) => panic!("IPv6 not yet implemented"),
                                 Version4(ref value) => {
@@ -123,13 +125,22 @@ fn main() {
                                     if client_cache.contains_key(&key) {
                                         println!("Found key {:?}", key);
                                         if server_cache.contains_key(&key) {
-                                            println!("TODO");
+                                            /*match server_cache.get(&key) {
+                                                Err(_err) => (),
+                                                Ok(data) => println!("derps: {:?}", data),
+                                            }*/
+                                            println!("ASDL: {:?}", server_cache.get(&key).unwrap());
                                         }else{
+                                            println!("payload: {:?}", &resp_pkt.payload);
                                             server_cache.insert(key, ServerCacheEntry {
                                                 ts: SystemTime::now(),
                                                 seq: 0,
-                                                data: &[0, 1, 3, 4],
-                                                //data: &resp_pkt.payload.clone(),
+                                                //data: &[0, 1, 3, 4],
+                                                //data: Vec::new().extend(&resp_pkt.payload.iter().cloned()),
+                                                //data: vec![1, 2, 3, 4],
+                                                data: resp_pkt.payload.to_vec(),
+                                                //data: resp_pkt.payload.clone(),
+
                                             });
                                         }
                                     }
