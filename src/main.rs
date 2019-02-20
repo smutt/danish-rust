@@ -33,8 +33,8 @@ fn main() {
     println!("Start");
 
     // Setup our cache
-    let mut client_cache = HashMap::new();
-    let mut server_cache = HashMap::new();
+    let mut client_cache: HashMap<String, ClientCacheEntry> = HashMap::new();
+    let mut server_cache: HashMap<String, ServerCacheEntry> = HashMap::new();
 
     ctrlc::set_handler(move || {
         euthanize();
@@ -85,7 +85,7 @@ fn main() {
                 match parse_sni(pkt.payload) {
                     Err(_) => panic!("Cannot parse SNI"),
                     Ok(sni) => {
-                        println!("Inserting client_cache key: {:?} sni: {:?}", derive_cache_key(&ip_src, &ip_dst, &value.source_port), sni);
+                        println!("Inserting client_cache entry: {:?} sni: {:?}", derive_cache_key(&ip_src, &ip_dst, &value.source_port), sni);
                         client_cache.insert(derive_cache_key(&ip_src, &ip_dst, &value.source_port), ClientCacheEntry {
                             ts: SystemTime::now(),
                             sni: sni,
@@ -119,27 +119,44 @@ fn main() {
                                     let key = derive_cache_key(&resp_ip_dst, &resp_ip_src, &tcp.destination_port);
                                     if client_cache.contains_key(&key) {
                                         println!("Found client_cache key {:?}", key);
+                                        /* The Certificate TLS message may not be the first TLS message we receive.
+                                        It will also likely span multiple TCP packets. Thus we need to test every payload
+                                        received to see if it is complete, if not we need to store it until we get the
+                                        next segment and test completeness again. If it is complete, but still not a
+                                        Certificate TLS message we need to flush cache and start waiting again. */
                                         match server_cache.get(&key) {
-                                            Some(ref entry) => {
+                                            Some(entry) => {
                                                 println!("Found server_cache key {:?}", key);
                                                 println!("server_cache: {:?}", entry);
-                                                match parse_cert(&resp_pkt.payload) {
+                                                match parse_cert(&entry.data.append(&resp_pkt.payload.to_vec())) { // Need to convert to &[u8] here
                                                     Ok(cert) => println!("X509_cert: {:?}", cert),
                                                     Err(err) => {
-                                                        println!("parse_cert_err: {:?}", err);
-                                                        // Update server_cache.get(&key)
+                                                        match err {
+                                                            CertParseError::IncorrectTlsRecord => {
+                                                                println!("Flushing server_cache entry: {:?}", key);
+                                                            }
+                                                            CertParseError::IncompleteTlsRecord => {
+                                                                println!("Updating server_cache entry: {:?}", key);
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
                                             _ => {
                                                 match parse_cert(&resp_pkt.payload) {
                                                     Ok(cert) => println!("X509_cert: {:?}", cert),
-                                                    Err(_) => {
-                                                        server_cache.insert(key, ServerCacheEntry {
-                                                            ts: SystemTime::now(),
-                                                            seq: tcp.sequence_number + resp_pkt.payload.len() as u32,
-                                                            data: resp_pkt.payload.to_vec(),
-                                                        });
+                                                    Err(err)=> {
+                                                        match err {
+                                                            CertParseError::IncorrectTlsRecord => (),
+                                                            CertParseError::IncompleteTlsRecord => {
+                                                                println!("Inserting server_cache entry: {:?}", key);
+                                                                server_cache.insert(key, ServerCacheEntry {
+                                                                    ts: SystemTime::now(),
+                                                                    seq: tcp.sequence_number + resp_pkt.payload.len() as u32,
+                                                                    data: resp_pkt.payload.to_vec(),
+                                                                });
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
