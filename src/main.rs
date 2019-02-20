@@ -156,15 +156,38 @@ fn main() {
     println!("Finish");
 }
 
+//Types of errors we can generate from parse_cert()
+#[derive(Debug)]
+enum CertParseError {
+    IncorrectTlsRecord,
+    IncompleteTlsRecord,
+}
+
 // Parse the X.509 cert from TLS ServerHello Messages
-fn parse_cert(payload: &[u8]) -> Result<String, &str> {
+fn parse_cert(payload: &[u8]) -> Result<Vec<tls::RawCertificate>, CertParseError> {
    match tls::parse_tls_plaintext(payload) {
-        Ok(value) => {
-            println!("furst: {:?}", value);
+        Ok(whole) => {
+            println!("whole: {:?}", whole);
+            println!("len_msg: {:?}", whole.1.msg.len());
+            for msg in whole.1.msg.iter() {
+                match msg{
+                    tls::TlsMessage::Handshake(ref handshake) => {
+                        println!("handshake: {:?}", handshake);
+                        match handshake {
+                            tls::TlsMessageHandshake::Certificate(ref cert_record) => {
+                                println!("cert_record: {:?}", cert_record);
+                                return Ok(cert_record.cert_chain.clone());
+                            }
+                            _ => (),
+                        }
+                    }
+                    _ => (),
+                }
+            }
+            return Err(CertParseError::IncorrectTlsRecord);
         }
-       _ => return Err("parse_cert: Error parsing plaintext TLS payload"),
+       _ => return Err(CertParseError::IncompleteTlsRecord),
    }
-    Err("parse_cert: General error")
 }
 
 
@@ -178,7 +201,7 @@ fn euthanize() {
 fn parse_sni(payload: &[u8]) -> Result<String, &str> {
     match tls::parse_tls_plaintext(payload) {
         Ok(value) => {
-            match value.1.msg[0] {
+            match value.1.msg[0] { // Could be problematic because we don't iterate through all messages
                 tls::TlsMessage::Handshake(ref handshake) => {
                     match handshake {
                         tls::TlsMessageHandshake::ClientHello(ref ch) => {
