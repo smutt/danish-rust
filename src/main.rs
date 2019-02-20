@@ -128,7 +128,8 @@ fn main() {
                                             Some(entry) => {
                                                 println!("Found server_cache key {:?}", key);
                                                 println!("server_cache: {:?}", entry);
-                                                match parse_cert(&entry.data.append(&resp_pkt.payload.to_vec())) { // Need to convert to &[u8] here
+                                                let _raw_tls = &entry.data as &[u8];
+                                                /*match parse_cert(&entry.data.append(&resp_pkt.payload.to_vec())) { // Need to convert to &[u8] here
                                                     Ok(cert) => println!("X509_cert: {:?}", cert),
                                                     Err(err) => {
                                                         match err {
@@ -140,7 +141,7 @@ fn main() {
                                                             }
                                                         }
                                                     }
-                                                }
+                                                }*/
                                             }
                                             _ => {
                                                 match parse_cert(&resp_pkt.payload) {
