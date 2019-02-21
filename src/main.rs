@@ -14,15 +14,18 @@ use tls_parser::tls;
 use tls_parser::tls_extensions;
 //use iptables;
 
-#[allow(dead_code)]
-#[derive(Debug)]
+// Minimum TCP payload size we bother looking at in bytes
+const MIN_TCP_PAYLOAD_SIZE: usize = 100;
+
+//#[allow(dead_code)]
+#[derive(Debug, Clone)]
 struct ClientCacheEntry {
     ts: SystemTime,
     sni: String,
 }
 
-#[allow(dead_code)]
-#[derive(Debug)]
+//#[allow(dead_code)]
+#[derive(Debug, Clone)]
 struct ServerCacheEntry {
     ts: SystemTime,
     seq: u32,
@@ -64,6 +67,10 @@ fn main() {
             .expect("Failed to decode packet");
         //println!("Everything: {:?}", pkt);
 
+        if pkt.payload.len() < MIN_TCP_PAYLOAD_SIZE {
+            continue;
+        }
+
         let ip_src: [u8;4];
         let ip_dst: [u8;4];
 
@@ -96,6 +103,10 @@ fn main() {
                                 .expect("Failed to decode resp_packet");
                             //println!("Everything: {:?}", resp_pkt);
 
+                            if resp_pkt.payload.len() < MIN_TCP_PAYLOAD_SIZE {
+                                continue;
+                            }
+
                             let resp_ip_src: [u8;4];
                             let resp_ip_dst: [u8;4];
 
@@ -125,23 +136,30 @@ fn main() {
                                         next segment and test completeness again. If it is complete, but still not a
                                         Certificate TLS message we need to flush cache and start waiting again. */
                                         match server_cache.get(&key) {
-                                            Some(entry) => {
+                                            Some(ref entry) => {
                                                 println!("Found server_cache key {:?}", key);
-                                                println!("server_cache: {:?}", entry);
-                                                let _raw_tls = &entry.data as &[u8];
-                                                /*match parse_cert(&entry.data.append(&resp_pkt.payload.to_vec())) { // Need to convert to &[u8] here
+                                                //println!("server_cache: {:?}", entry);
+                                                let mut raw_tls = entry.data.clone();
+                                                raw_tls.extend_from_slice(&resp_pkt.payload);
+                                                match parse_cert(&raw_tls[..]) {
                                                     Ok(cert) => println!("X509_cert: {:?}", cert),
                                                     Err(err) => {
                                                         match err {
                                                             CertParseError::IncorrectTlsRecord => {
                                                                 println!("Flushing server_cache entry: {:?}", key);
+                                                                server_cache.remove(&key);
                                                             }
                                                             CertParseError::IncompleteTlsRecord => {
                                                                 println!("Updating server_cache entry: {:?}", key);
+                                                                server_cache.insert(key, ServerCacheEntry {
+                                                                    ts: SystemTime::now(),
+                                                                    seq: tcp.sequence_number + resp_pkt.payload.len() as u32,
+                                                                    data: raw_tls,
+                                                                });
                                                             }
                                                         }
                                                     }
-                                                }*/
+                                                }
                                             }
                                             _ => {
                                                 match parse_cert(&resp_pkt.payload) {
@@ -185,15 +203,15 @@ enum CertParseError {
 fn parse_cert(payload: &[u8]) -> Result<Vec<tls::RawCertificate>, CertParseError> {
    match tls::parse_tls_plaintext(payload) {
         Ok(whole) => {
-            println!("whole: {:?}", whole);
-            println!("len_msg: {:?}", whole.1.msg.len());
+            //println!("parse_cert>whole: {:?}", whole);
+            println!("parse_cert>len_msg: {:?}", whole.1.msg.len());
             for msg in whole.1.msg.iter() {
                 match msg{
                     tls::TlsMessage::Handshake(ref handshake) => {
-                        println!("handshake: {:?}", handshake);
+                        println!("parse_cert>handshake: {:?}", handshake);
                         match handshake {
                             tls::TlsMessageHandshake::Certificate(ref cert_record) => {
-                                println!("cert_record: {:?}", cert_record);
+                                println!("parse_cert>cert_record: {:?}", cert_record);
                                 return Ok(cert_record.cert_chain.clone());
                             }
                             _ => (),
