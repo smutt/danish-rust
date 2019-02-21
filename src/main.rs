@@ -2,6 +2,7 @@ extern crate ctrlc;
 extern crate pcap;
 extern crate etherparse;
 extern crate tls_parser;
+extern crate nom;
 
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -12,6 +13,8 @@ use etherparse::IpHeader::*;
 use etherparse::TransportHeader::*;
 use tls_parser::tls;
 use tls_parser::tls_extensions;
+use nom::Err;
+use nom::CompareResult;
 //use iptables;
 
 // Minimum TCP payload size we bother looking at in bytes
@@ -138,9 +141,10 @@ fn main() {
                                         match server_cache.get(&key) {
                                             Some(ref entry) => {
                                                 println!("Found server_cache key {:?}", key);
-                                                //println!("server_cache: {:?}", entry);
                                                 let mut raw_tls = entry.data.clone();
                                                 raw_tls.extend_from_slice(&resp_pkt.payload);
+                                                //println!("raw_tls: {:?}", raw_tls);
+                                                println!("{:?}", raw_tls.iter().map(|h| format!("{:X}", h)).collect::<Vec<_>>());
                                                 match parse_cert(&raw_tls[..]) {
                                                     Ok(cert) => println!("X509_cert: {:?}", cert),
                                                     Err(err) => {
@@ -150,18 +154,23 @@ fn main() {
                                                                 server_cache.remove(&key);
                                                             }
                                                             CertParseError::IncompleteTlsRecord => {
-                                                                println!("Updating server_cache entry: {:?}", key);
-                                                                server_cache.insert(key, ServerCacheEntry {
-                                                                    ts: SystemTime::now(),
-                                                                    seq: tcp.sequence_number + resp_pkt.payload.len() as u32,
-                                                                    data: raw_tls,
-                                                                });
+                                                                if entry.seq == tcp.sequence_number {
+                                                                    println!("Updating server_cache entry: {:?}", key);
+                                                                    server_cache.insert(key, ServerCacheEntry {
+                                                                        ts: SystemTime::now(),
+                                                                        seq: tcp.sequence_number + resp_pkt.payload.len() as u32,
+                                                                        data: raw_tls,
+                                                                    });
+                                                                }else{
+                                                                    println!("Out-of-order TCP datagrams detected"); // TODO
+                                                                }
                                                             }
                                                         }
                                                     }
                                                 }
                                             }
                                             _ => {
+                                                println!("No server_cache key {:?}", key);
                                                 match parse_cert(&resp_pkt.payload) {
                                                     Ok(cert) => println!("X509_cert: {:?}", cert),
                                                     Err(err)=> {
@@ -197,11 +206,14 @@ fn main() {
 enum CertParseError {
     IncorrectTlsRecord,
     IncompleteTlsRecord,
+    Error,
+    Failure,
 }
 
 // Parse the X.509 cert from TLS ServerHello Messages
 fn parse_cert(payload: &[u8]) -> Result<Vec<tls::RawCertificate>, CertParseError> {
-   match tls::parse_tls_plaintext(payload) {
+    println!("Entered parse_cert()");
+    match tls::parse_tls_plaintext(payload) {
         Ok(whole) => {
             //println!("parse_cert>whole: {:?}", whole);
             println!("parse_cert>len_msg: {:?}", whole.1.msg.len());
@@ -222,8 +234,16 @@ fn parse_cert(payload: &[u8]) -> Result<Vec<tls::RawCertificate>, CertParseError
             }
             return Err(CertParseError::IncorrectTlsRecord);
         }
-       _ => return Err(CertParseError::IncompleteTlsRecord),
-   }
+        nom::Err::Incomplete(err) => {
+            println!("Error with parse_tls_plaintext: {:?}", err);
+        }
+/*            match err {
+                Incomplete(_) => return Err(CertParseError::IncompleteTlsRecord),
+                Error(_) = > return Err(CertParseError::Err),
+                Failure(_) => return Err(CertParseError::Failure),
+            }*/
+    }
+    }
 }
 
 
