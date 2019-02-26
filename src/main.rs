@@ -13,12 +13,9 @@ use etherparse::IpHeader::*;
 use etherparse::TransportHeader::*;
 use tls_parser::tls;
 use tls_parser::tls_extensions;
-use nom::Err;
-use nom::CompareResult;
+//use nom::Err;
+//use nom::CompareResult;
 //use iptables;
-
-// Minimum TCP payload size we bother looking at in bytes
-const MIN_TCP_PAYLOAD_SIZE: usize = 100;
 
 //#[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -70,10 +67,6 @@ fn main() {
             .expect("Failed to decode packet");
         //println!("Everything: {:?}", pkt);
 
-        if pkt.payload.len() < MIN_TCP_PAYLOAD_SIZE {
-            continue;
-        }
-
         let ip_src: [u8;4];
         let ip_dst: [u8;4];
 
@@ -106,10 +99,6 @@ fn main() {
                                 .expect("Failed to decode resp_packet");
                             //println!("Everything: {:?}", resp_pkt);
 
-                            if resp_pkt.payload.len() < MIN_TCP_PAYLOAD_SIZE {
-                                continue;
-                            }
-
                             let resp_ip_src: [u8;4];
                             let resp_ip_dst: [u8;4];
 
@@ -127,6 +116,21 @@ fn main() {
                             match resp_pkt.transport.unwrap() {
                                 Udp(_) => println!("UDP transport captured when TCP expected"),
                                 Tcp(ref tcp) => {
+                                    /* There's a chance that the payload will be Ethernet padding,
+                                    and this is our stupid way to check. */
+                                    if resp_pkt.payload.len() <= 6 {
+                                        let mut padding = true;
+                                        for &byte in resp_pkt.payload.iter() {
+                                            if byte != u8::min_value() {
+                                                padding = false;
+                                            }
+                                        }
+                                        if padding {
+                                            println!("Padded ethernet frame detected: {:?}", resp_pkt.payload);
+                                            continue;
+                                        }
+                                    }
+
                                     println!("resp_tcp_seq: {:?}", tcp.sequence_number);
                                     println!("payload_len: {:?}", resp_pkt.payload.len());
 
@@ -143,17 +147,15 @@ fn main() {
                                                 println!("Found server_cache key {:?}", key);
                                                 let mut raw_tls = entry.data.clone();
                                                 raw_tls.extend_from_slice(&resp_pkt.payload);
-                                                //println!("raw_tls: {:?}", raw_tls);
-                                                println!("{:?}", raw_tls.iter().map(|h| format!("{:X}", h)).collect::<Vec<_>>());
                                                 match parse_cert(&raw_tls[..]) {
                                                     Ok(cert) => println!("X509_cert: {:?}", cert),
                                                     Err(err) => {
                                                         match err {
-                                                            CertParseError::IncorrectTlsRecord => {
+                                                            CertParseError::WrongTlsRecord => {
                                                                 println!("Flushing server_cache entry: {:?}", key);
                                                                 server_cache.remove(&key);
                                                             }
-                                                            CertParseError::IncompleteTlsRecord => {
+                                                            CertParseError::IncompleteTlsRecord | CertParseError::WrongTlsHandshakeRecord => {
                                                                 if entry.seq == tcp.sequence_number {
                                                                     println!("Updating server_cache entry: {:?}", key);
                                                                     server_cache.insert(key, ServerCacheEntry {
@@ -175,8 +177,13 @@ fn main() {
                                                     Ok(cert) => println!("X509_cert: {:?}", cert),
                                                     Err(err)=> {
                                                         match err {
-                                                            CertParseError::IncorrectTlsRecord => (),
-                                                            CertParseError::IncompleteTlsRecord => {
+                                                            /*CertParseError::WrongTlsHandshakeRecord => {
+                                                                println!("Wrong Handshake tls record");
+                                                            }*/
+                                                            CertParseError::WrongTlsRecord => {
+                                                                println!("Incorrect tls record");
+                                                            }
+                                                            CertParseError::IncompleteTlsRecord | CertParseError::WrongTlsHandshakeRecord => {
                                                                 println!("Inserting server_cache entry: {:?}", key);
                                                                 server_cache.insert(key, ServerCacheEntry {
                                                                     ts: SystemTime::now(),
@@ -204,15 +211,15 @@ fn main() {
 //Types of errors we can generate from parse_cert()
 #[derive(Debug)]
 enum CertParseError {
-    IncorrectTlsRecord,
     IncompleteTlsRecord,
-    Error,
-    Failure,
+    WrongTlsRecord,
+    WrongTlsHandshakeRecord,
 }
 
 // Parse the X.509 cert from TLS ServerHello Messages
 fn parse_cert(payload: &[u8]) -> Result<Vec<tls::RawCertificate>, CertParseError> {
-    println!("Entered parse_cert()");
+    println!("Entered parse_cert() payload.len: {:?}", payload.len());
+    //println!("{:?}", payload.iter().map(|h| format!("{:X}", h)).collect::<Vec<_>>());
     match tls::parse_tls_plaintext(payload) {
         Ok(whole) => {
             //println!("parse_cert>whole: {:?}", whole);
@@ -226,23 +233,17 @@ fn parse_cert(payload: &[u8]) -> Result<Vec<tls::RawCertificate>, CertParseError
                                 println!("parse_cert>cert_record: {:?}", cert_record);
                                 return Ok(cert_record.cert_chain.clone());
                             }
-                            _ => (),
+                            _ => return Err(CertParseError::WrongTlsHandshakeRecord),
                         }
                     }
                     _ => (),
                 }
             }
-            return Err(CertParseError::IncorrectTlsRecord);
+            return Err(CertParseError::WrongTlsRecord);
         }
-        nom::Err::Incomplete(err) => {
-            println!("Error with parse_tls_plaintext: {:?}", err);
+        Err(_) => {
+            return Err(CertParseError::IncompleteTlsRecord);
         }
-/*            match err {
-                Incomplete(_) => return Err(CertParseError::IncompleteTlsRecord),
-                Error(_) = > return Err(CertParseError::Err),
-                Failure(_) => return Err(CertParseError::Failure),
-            }*/
-    }
     }
 }
 
