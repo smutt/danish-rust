@@ -99,6 +99,14 @@ fn main() {
                                 .expect("Failed to decode resp_packet");
                             //println!("Everything: {:?}", resp_pkt);
 
+                            /* pcap/Etherparse strips the Ethernet FCS before it hands the packet to us.
+                            So a 60 byte packet was 64 bytes on the wire.
+                            Etherparse interprets any Ethernet padding as TCP data. I consider this a bug.
+                            Therefore, we ignore any packet 60 bytes or less to prevent us from storing erroneous TCP payloads.
+                            The chances of us actually needing that small of a packet are close to zero. */
+                            if resp_packet.len() <= 60 {
+                                continue;
+                            }
                             let resp_ip_src: [u8;4];
                             let resp_ip_dst: [u8;4];
 
@@ -116,21 +124,6 @@ fn main() {
                             match resp_pkt.transport.unwrap() {
                                 Udp(_) => println!("UDP transport captured when TCP expected"),
                                 Tcp(ref tcp) => {
-                                    /* There's a chance that the payload will be Ethernet padding,
-                                    and this is our stupid way to check. */
-                                    if resp_pkt.payload.len() <= 6 {
-                                        let mut padding = true;
-                                        for &byte in resp_pkt.payload.iter() {
-                                            if byte != u8::min_value() {
-                                                padding = false;
-                                            }
-                                        }
-                                        if padding {
-                                            println!("Padded ethernet frame detected: {:?}", resp_pkt.payload);
-                                            continue;
-                                        }
-                                    }
-
                                     println!("resp_tcp_seq: {:?}", tcp.sequence_number);
                                     println!("payload_len: {:?}", resp_pkt.payload.len());
 
