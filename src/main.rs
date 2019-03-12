@@ -212,7 +212,7 @@ enum CertParseError {
 // Parse the X.509 cert from TLS ServerHello Messages
 fn parse_cert(payload: &[u8]) -> Result<Vec<tls::RawCertificate>, CertParseError> {
     println!("Entered parse_cert() payload.len: {:?}", payload.len());
-    //println!("{:?}", payload.iter().map(|h| format!("{:X}", h)).collect::<Vec<_>>());
+    println!("hex {:?}", payload.iter().map(|h| format!("{:X}", h)).collect::<Vec<_>>());
     match tls::parse_tls_plaintext(payload) {
         Ok(whole) => {
             //println!("parse_cert>whole: {:?}", whole);
