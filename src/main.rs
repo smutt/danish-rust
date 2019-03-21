@@ -141,14 +141,10 @@ fn main() {
                                                 let mut raw_tls = entry.data.clone();
                                                 raw_tls.extend_from_slice(&resp_pkt.payload);
                                                 match parse_cert(&raw_tls[..]) {
-                                                    Ok(cert) => println!("X509_cert: {:?}", cert),
+                                                    Ok(cert_chain) => println!("X509_cert: {:?}", cert_chain),
                                                     Err(err) => {
                                                         match err {
-                                                            CertParseError::WrongTlsRecord => {
-                                                                println!("Flushing server_cache entry: {:?}", key);
-                                                                server_cache.remove(&key);
-                                                            }
-                                                            CertParseError::IncompleteTlsRecord | CertParseError::WrongTlsHandshakeRecord => {
+                                                            CertParseError::IncompleteTlsRecord | CertParseError::WrongTlsRecord => {
                                                                 if entry.seq == tcp.sequence_number {
                                                                     println!("Updating server_cache entry: {:?}", key);
                                                                     server_cache.insert(key, ServerCacheEntry {
@@ -167,16 +163,10 @@ fn main() {
                                             _ => {
                                                 println!("No server_cache key {:?}", key);
                                                 match parse_cert(&resp_pkt.payload) {
-                                                    Ok(cert) => println!("X509_cert: {:?}", cert),
+                                                    Ok(cert_chain) => println!("X509_cert: {:?}", cert_chain),
                                                     Err(err)=> {
                                                         match err {
-                                                            /*CertParseError::WrongTlsHandshakeRecord => {
-                                                                println!("Wrong Handshake tls record");
-                                                            }*/
-                                                            CertParseError::WrongTlsRecord => {
-                                                                println!("Incorrect tls record");
-                                                            }
-                                                            CertParseError::IncompleteTlsRecord | CertParseError::WrongTlsHandshakeRecord => {
+                                                            CertParseError::IncompleteTlsRecord | CertParseError::WrongTlsRecord => {
                                                                 println!("Inserting server_cache entry: {:?}", key);
                                                                 server_cache.insert(key, ServerCacheEntry {
                                                                     ts: SystemTime::now(),
@@ -206,40 +196,32 @@ fn main() {
 enum CertParseError {
     IncompleteTlsRecord,
     WrongTlsRecord,
-    WrongTlsHandshakeRecord,
 }
 
 // Parse the X.509 cert from TLS ServerHello Messages
+// Recursively call parse_tls_plaintext() until we find the TLS Certificate Record or Error
 fn parse_cert(payload: &[u8]) -> Result<Vec<tls::RawCertificate>, CertParseError> {
-    println!("Entered parse_cert() payload.len: {:?}", payload.len());
-    println!("hex {:?}", payload.iter().map(|h| format!("{:X}", h)).collect::<Vec<_>>());
     match tls::parse_tls_plaintext(payload) {
-        Ok(whole) => {
-            //println!("parse_cert>whole: {:?}", whole);
-            println!("parse_cert>len_msg: {:?}", whole.1.msg.len());
-            for msg in whole.1.msg.iter() {
-                match msg{
+        Ok(plaintext) => {
+            for msg in plaintext.1.msg.iter() {
+                match msg {
                     tls::TlsMessage::Handshake(ref handshake) => {
                         println!("parse_cert>handshake: {:?}", handshake);
                         match handshake {
                             tls::TlsMessageHandshake::Certificate(ref cert_record) => {
-                                println!("parse_cert>cert_record: {:?}", cert_record);
                                 return Ok(cert_record.cert_chain.clone());
                             }
-                            _ => return Err(CertParseError::WrongTlsHandshakeRecord),
+                            _ => return parse_cert(&plaintext.0),
                         }
                     }
-                    _ => (),
+                    _ => return parse_cert(&plaintext.0),
                 }
             }
             return Err(CertParseError::WrongTlsRecord);
         }
-        Err(_) => {
-            return Err(CertParseError::IncompleteTlsRecord);
-        }
+        Err(_) => return Err(CertParseError::IncompleteTlsRecord),
     }
 }
-
 
 // Die gracefully
 fn euthanize() {
