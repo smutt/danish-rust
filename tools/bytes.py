@@ -15,18 +15,18 @@ def printNibbles(chars):
   for c in chars:
     if len(c) == 1:
       c = "0" + c
-    outStr += c
+    outStr += c + " "
     if(int(c, 16) > 32 and int(c, 16) < 127):
       outAsc += chr(int(c, 16))
     else:
       outAsc += "."
 
     if(ii % 4 == 0):
-      outStr += " "
+      outStr += "  "
 
     if(ii % 16 == 0):
       print(outStr + " | " + outAsc)
-      outStr = str(ii).zfill(4) + " | "
+      outStr = format(ii, 'X').zfill(4) + " | "
       outAsc = ""
     ii += 1
   print(outStr)
