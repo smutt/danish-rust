@@ -11,3 +11,5 @@ etherparse = { version = "0.8.0" }
 iptables = { version = "0.2" }
 tls-parser = { version = "0.7.0" }
 nom = { version = "^4.1" }
+log = "0.4.0"
+env_logger = "0.6.1"

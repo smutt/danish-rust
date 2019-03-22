@@ -1,9 +1,13 @@
+#[macro_use]
+extern crate log;
+extern crate env_logger;
 extern crate ctrlc;
 extern crate pcap;
 extern crate etherparse;
 extern crate tls_parser;
 extern crate nom;
 
+//use log::Level;
 use std::collections::HashMap;
 use std::time::SystemTime;
 use pcap::Device;
@@ -16,6 +20,23 @@ use tls_parser::tls_extensions;
 //use nom::Err;
 //use nom::CompareResult;
 //use iptables;
+
+//Types of errors we can generate from parse_cert()
+#[derive(Debug)]
+enum CertParseError {
+    IncompleteTlsRecord,
+    WrongTlsRecord,
+}
+
+//Types of errors we can generate from parse_sni()
+#[derive(Debug)]
+enum SniParseError {
+    TlsExtensionError,
+    ClientHelloNotFound,
+    IncorrectMsgType,
+    PayloadParsing,
+    General,
+}
 
 #[derive(Debug, Clone)]
 struct ClientCacheEntry {
@@ -32,7 +53,8 @@ struct ServerCacheEntry {
 }
 
 fn main() {
-    dbg!("Start");
+    env_logger::builder().default_format_timestamp(false).init();
+    info!("Start");
 
     // Setup our cache
     let mut client_cache: HashMap<String, ClientCacheEntry> = HashMap::new();
@@ -52,42 +74,45 @@ fn main() {
     let mut client_cap = Device::lookup().unwrap().open().unwrap();
     match client_cap.filter(bpf_client_4){
         Ok(_) => (),
-        Err(err) => println!("BPF error {}", err.to_string()),
+        Err(err) => error!("BPF error {}", err.to_string()),
     }
 
     let mut server_cap = Device::lookup().unwrap().open().unwrap();
     match server_cap.filter(bpf_server_4){
         Ok(_) => (),
-        Err(err) => println!("BPF error {}", err.to_string()),
+        Err(err) => error!("BPF error {}", err.to_string()),
     }
 
     while let Ok(packet) = client_cap.next() {
         let pkt = PacketHeaders::from_ethernet_slice(&packet)
             .expect("Failed to decode packet");
-        //println!("Everything: {:?}", pkt);
+        //debug!("Everything: {:?}", pkt);
 
         let ip_src: [u8;4];
         let ip_dst: [u8;4];
 
         match pkt.ip.unwrap() {
-            Version6(_) => panic!("IPv6 not yet implemented"),
+            Version6(_) => {
+                warn!("IPv6 packet captured, but not yet implemented");
+                continue;
+            }
             Version4(ref value) => {
                 /* The next match stmt should come here. Will do when we break this out async */
                 ip_src = value.source;
                 ip_dst = value.destination;
             }
         }
-        //println!("IP_src: {:?}", ip_src);
-        //println!("IP_dst: {:?}", ip_dst);
+        //debug!("IP_src: {:?}", ip_src);
+        //debug!("IP_dst: {:?}", ip_dst);
 
         match pkt.transport.unwrap() {
-            Udp(_) => println!("UDP transport captured when TCP expected"),
+            Udp(_) => error!("UDP transport captured when TCP expected"),
             Tcp(ref value) => {
-                //println!("tcp_port: {:?}", tcp_port);
+                //debug!("tcp_port: {:?}", tcp_port);
                 match parse_sni(pkt.payload) {
-                    Err(_) => panic!("Cannot parse SNI"),
+                    Err(_) => error!("Error parsing SNI"),
                     Ok(sni) => {
-                        println!("Inserting client_cache entry: {:?} sni: {:?}", derive_cache_key(&ip_src, &ip_dst, &value.source_port), sni);
+                        debug!("Inserting client_cache entry: {:?} sni: {:?}", derive_cache_key(&ip_src, &ip_dst, &value.source_port), sni);
                         client_cache.insert(derive_cache_key(&ip_src, &ip_dst, &value.source_port), ClientCacheEntry {
                             ts: SystemTime::now(),
                             sni: sni,
@@ -96,7 +121,7 @@ fn main() {
                         while let Ok(resp_packet) = server_cap.next() {
                             let resp_pkt = PacketHeaders::from_ethernet_slice(&resp_packet)
                                 .expect("Failed to decode resp_packet");
-                            //println!("Everything: {:?}", resp_pkt);
+                            //debug!("Everything: {:?}", resp_pkt);
 
                             /* pcap/Etherparse strips the Ethernet FCS before it hands the packet to us.
                             So a 60 byte packet was 64 bytes on the wire.
@@ -110,25 +135,28 @@ fn main() {
                             let resp_ip_dst: [u8;4];
 
                             match resp_pkt.ip.unwrap() {
-                                Version6(_) => panic!("IPv6 not yet implemented"),
+                                Version6(_) => {
+                                    warn!("IPv6 packet captured, but not yet implemented");
+                                    continue;
+                                }
                                 Version4(ref value) => {
                                     /* The next match stmt should come here. Will do when we break this out async */
                                     resp_ip_src = value.source;
                                     resp_ip_dst = value.destination;
                                 }
                             }
-                            //println!("resp_IP_src: {:?}", resp_ip_src);
-                            //println!("resp_IP_dst: {:?}", resp_ip_dst);
+                            //debug!("resp_IP_src: {:?}", resp_ip_src);
+                            //debug!("resp_IP_dst: {:?}", resp_ip_dst);
 
                             match resp_pkt.transport.unwrap() {
-                                Udp(_) => println!("UDP transport captured when TCP expected"),
+                                Udp(_) => warn!("UDP transport captured when TCP expected"),
                                 Tcp(ref tcp) => {
-                                    println!("resp_tcp_seq: {:?}", tcp.sequence_number);
-                                    println!("payload_len: {:?}", resp_pkt.payload.len());
+                                    debug!("resp_tcp_seq: {:?}", tcp.sequence_number);
+                                    debug!("payload_len: {:?}", resp_pkt.payload.len());
 
                                     let key = derive_cache_key(&resp_ip_dst, &resp_ip_src, &tcp.destination_port);
                                     if client_cache.contains_key(&key) {
-                                        println!("Found client_cache key {:?}", key);
+                                        debug!("Found client_cache key {:?}", key);
                                         /* The Certificate TLS message may not be the first TLS message we receive.
                                         It will also likely span multiple TCP packets. Thus we need to test every payload
                                         received to see if it is complete, if not we need to store it until we get the
@@ -137,17 +165,17 @@ fn main() {
                                         match server_cache.get(&key) {
                                             Some(ref entry) => {
                                                 if entry.cert_chain.len() > 0 {
-                                                    println!("Ignoring server_cache key {:?}", key);
+                                                    debug!("Ignoring server_cache key {:?}", key);
                                                     continue;
                                                 }
 
-                                                println!("Found server_cache key {:?}", key);
+                                                debug!("Found server_cache key {:?}", key);
                                                 let mut raw_tls = entry.data.clone();
                                                 raw_tls.extend_from_slice(&resp_pkt.payload);
                                                 match parse_cert(&raw_tls[..]) {
                                                     Ok(cert_chain) => {
-                                                        println!("cert_len: {:?}", cert_chain.len());
-                                                        println!("Finalizing server_cache entry: {:?}", key);
+                                                        debug!("cert_len: {:?}", cert_chain.len());
+                                                        debug!("Finalizing server_cache entry: {:?}", key);
                                                         server_cache.insert(key, ServerCacheEntry {
                                                             ts: SystemTime::now(),
                                                             seq: 0,
@@ -159,7 +187,7 @@ fn main() {
                                                         match err {
                                                             CertParseError::IncompleteTlsRecord | CertParseError::WrongTlsRecord => {
                                                                 if entry.seq == tcp.sequence_number {
-                                                                    println!("Updating server_cache entry: {:?}", key);
+                                                                    debug!("Updating server_cache entry: {:?}", key);
                                                                     server_cache.insert(key, ServerCacheEntry {
                                                                         ts: SystemTime::now(),
                                                                         seq: tcp.sequence_number + resp_pkt.payload.len() as u32,
@@ -167,7 +195,7 @@ fn main() {
                                                                         cert_chain: Vec::new(),
                                                                     });
                                                                 }else{
-                                                                    println!("Out-of-order TCP datagrams detected"); // TODO
+                                                                    debug!("Out-of-order TCP datagrams detected"); // TODO
                                                                 }
                                                             }
                                                         }
@@ -175,11 +203,11 @@ fn main() {
                                                 }
                                             }
                                             _ => {
-                                                println!("No server_cache key {:?}", key);
+                                                debug!("No server_cache key {:?}", key);
                                                 match parse_cert(&resp_pkt.payload) {
                                                     Ok(cert_chain) => {
-                                                        println!("cert_len: {:?}", cert_chain.len());
-                                                        println!("Finalizing server_cache entry: {:?}", key);
+                                                        debug!("cert_len: {:?}", cert_chain.len());
+                                                        debug!("Finalizing server_cache entry: {:?}", key);
                                                         server_cache.insert(key, ServerCacheEntry {
                                                             ts: SystemTime::now(),
                                                             seq: 0,
@@ -190,7 +218,7 @@ fn main() {
                                                     Err(err)=> {
                                                         match err {
                                                             CertParseError::IncompleteTlsRecord | CertParseError::WrongTlsRecord => {
-                                                                println!("Inserting server_cache entry: {:?}", key);
+                                                                debug!("Inserting server_cache entry: {:?}", key);
                                                                 server_cache.insert(key, ServerCacheEntry {
                                                                     ts: SystemTime::now(),
                                                                     seq: tcp.sequence_number + resp_pkt.payload.len() as u32,
@@ -212,27 +240,21 @@ fn main() {
             }
         }
     }
-    println!("Finish");
+    info!("Finish");
 }
 
-//Types of errors we can generate from parse_cert()
-#[derive(Debug)]
-enum CertParseError {
-    IncompleteTlsRecord,
-    WrongTlsRecord,
-}
 
 // Parse the X.509 cert from TLS ServerHello Messages
 // Recursively call parse_tls_plaintext() until we find the TLS Certificate Record or Error
 fn parse_cert(payload: &[u8]) -> Result<Vec<Vec<u8>>, CertParseError> {
-    //println!("Entered parse_cert() payload.len: {:?}", payload.len());
-    //println!("hex {:?}", payload.iter().map(|h| format!("{:X}", h)).collect::<Vec<_>>());
+    //debug!("Entered parse_cert() payload.len: {:?}", payload.len());
+    //debug!("hex {:?}", payload.iter().map(|h| format!("{:X}", h)).collect::<Vec<_>>());
     match tls::parse_tls_plaintext(payload) {
         Ok(plaintext) => {
             for msg in plaintext.1.msg.iter() {
                 match msg {
                     tls::TlsMessage::Handshake(ref handshake) => {
-                        //println!("parse_cert>handshake: {:?}", handshake);
+                        //debug!("parse_cert>handshake: {:?}", handshake);
                         match handshake {
                             tls::TlsMessageHandshake::Certificate(ref cert_record) => {
                                 return Ok(cert_record.cert_chain.iter().map(|c| c.data.to_vec()).collect::<Vec<_>>());
@@ -251,12 +273,12 @@ fn parse_cert(payload: &[u8]) -> Result<Vec<Vec<u8>>, CertParseError> {
 
 // Die gracefully
 fn euthanize() {
-    dbg!("Ctrl-C exiting");
+    info!("Ctrl-C exiting");
     std::process::exit(0);
 }
 
 // Parse out the SNI from passed TLS payload
-fn parse_sni(payload: &[u8]) -> Result<String, &str> {
+fn parse_sni(payload: &[u8]) -> Result<String, SniParseError> {
     match tls::parse_tls_plaintext(payload) {
         Ok(value) => {
             match value.1.msg[0] { // TODO Problematic because we don't iterate through all messages
@@ -274,18 +296,18 @@ fn parse_sni(payload: &[u8]) -> Result<String, &str> {
                                         }
                                     }
                                 }
-                                _ => return Err("parse_sni: Error parsing TLS extensions"),
+                                _ => return Err(SniParseError::TlsExtensionError),
                             }
                         }
-                        _ => return Err("parse_sni: TLS ClientHello not found in handshake msg"),
+                        _ => return Err(SniParseError::ClientHelloNotFound),
                     }
                 }
-                _ => return Err("parse_sni: Incorrect TLS msg type"),
+                _ => return Err(SniParseError::IncorrectMsgType),
             }
         }
-        _ => return Err("parse_sni: Error parsing plaintext TLS payload"),
+        _ => return Err(SniParseError::PayloadParsing),
     }
-    Err("parse_sni: General error")
+    Err(SniParseError::General)
 }
 
 // Derives a cache key from unique pairing of values
