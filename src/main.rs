@@ -17,14 +17,12 @@ use tls_parser::tls_extensions;
 //use nom::CompareResult;
 //use iptables;
 
-//#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct ClientCacheEntry {
     ts: SystemTime, // Last touched timestamp
     sni: String, // SNI
 }
 
-//#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct ServerCacheEntry {
     ts: SystemTime, // Last touched timestamp
@@ -34,7 +32,7 @@ struct ServerCacheEntry {
 }
 
 fn main() {
-    println!("Start");
+    dbg!("Start");
 
     // Setup our cache
     let mut client_cache: HashMap<String, ClientCacheEntry> = HashMap::new();
@@ -237,11 +235,7 @@ fn parse_cert(payload: &[u8]) -> Result<Vec<Vec<u8>>, CertParseError> {
                         //println!("parse_cert>handshake: {:?}", handshake);
                         match handshake {
                             tls::TlsMessageHandshake::Certificate(ref cert_record) => {
-                                let mut rv: Vec<Vec<u8>> = Vec::new();
-                                for raw_cert in cert_record.cert_chain.iter() {
-                                    rv.push(raw_cert.data.to_vec());
-                                }
-                                return Ok(rv);
+                                return Ok(cert_record.cert_chain.iter().map(|c| c.data.to_vec()).collect::<Vec<_>>());
                             }
                             _ => return parse_cert(&plaintext.0),
                         }
@@ -257,7 +251,7 @@ fn parse_cert(payload: &[u8]) -> Result<Vec<Vec<u8>>, CertParseError> {
 
 // Die gracefully
 fn euthanize() {
-    println!("Ctrl-C exiting");
+    dbg!("Ctrl-C exiting");
     std::process::exit(0);
 }
 
