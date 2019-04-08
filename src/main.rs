@@ -7,18 +7,16 @@ extern crate etherparse;
 extern crate tls_parser;
 extern crate nom;
 
-//use log::Level;
+use std::thread;
+use std::sync::{Mutex, Arc};
 use std::collections::HashMap;
 use std::time::SystemTime;
 use pcap::Device;
-//use etherparse::SlicedPacket;
 use etherparse::PacketHeaders;
 use etherparse::IpHeader::*;
 use etherparse::TransportHeader::*;
 use tls_parser::tls;
 use tls_parser::tls_extensions;
-//use nom::Err;
-//use nom::CompareResult;
 //use iptables;
 
 //Types of errors we can generate from parse_cert()
@@ -56,177 +54,178 @@ fn main() {
     env_logger::builder().default_format_timestamp(false).init();
     info!("Start");
 
-    // Setup our cache
-    let mut client_cache: HashMap<String, ClientCacheEntry> = HashMap::new();
-    let mut server_cache: HashMap<String, ServerCacheEntry> = HashMap::new();
-
     ctrlc::set_handler(move || {
         euthanize();
     }).expect("Error setting Ctrl-C handler");
 
-    // http://serverfault.com/questions/574405/tcpdump-server-hello-certificate-filter
-    //ACK == 1 && RST == 0 && SYN == 0 && FIN == 0
-    //Must accept TCP fragments
-    let bpf_client_4 = "(tcp[((tcp[12:1] & 0xf0) >> 2)+5:1] = 0x01) and (tcp[((tcp[12:1] & 0xf0) >> 2):1] = 0x16) and (dst port 443)";
-    let bpf_server_4 = "tcp and src port 443 and (tcp[tcpflags] & tcp-ack = 16) and (tcp[tcpflags] & tcp-syn != 2) and 
-        (tcp[tcpflags] & tcp-fin != 1) and (tcp[tcpflags] & tcp-rst != 1)";
+    let mut threads = vec![]; // Our threads
 
-    let mut client_cap = Device::lookup().unwrap().open().unwrap();
-    match client_cap.filter(bpf_client_4){
-        Ok(_) => (),
-        Err(err) => error!("BPF error {}", err.to_string()),
-    }
+    // Setup our cache
+    let client_cache = Arc::new(Mutex::new(HashMap::<String, ClientCacheEntry>::new()));
+    let client_cache_cl_ptr = Arc::clone(&client_cache);
+    let client_cache_sr_ptr = Arc::clone(&client_cache);
+    //let mut client_cache: HashMap<String, ClientCacheEntry> = HashMap::new();
+    let mut server_cache: HashMap<String, ServerCacheEntry> = HashMap::new();
 
-    let mut server_cap = Device::lookup().unwrap().open().unwrap();
-    match server_cap.filter(bpf_server_4){
-        Ok(_) => (),
-        Err(err) => error!("BPF error {}", err.to_string()),
-    }
+    let client_4_thr = thread::spawn(move || {
+        // ACK == 1 && RST == 0 && SYN == 0 && FIN == 0 && must accept TCP fragments
+        let bpf_client_4 = "(tcp[((tcp[12:1] & 0xf0) >> 2)+5:1] = 0x01) and (tcp[((tcp[12:1] & 0xf0) >> 2):1] = 0x16) and (dst port 443)";
+        let mut client_cap = Device::lookup().unwrap().open().unwrap();
+        match client_cap.filter(bpf_client_4){
+            Ok(_) => (),
+            Err(err) => error!("BPF error {}", err.to_string()),
+        }
 
-    while let Ok(packet) = client_cap.next() {
-        let pkt = PacketHeaders::from_ethernet_slice(&packet)
-            .expect("Failed to decode packet");
-        //debug!("Everything: {:?}", pkt);
+        while let Ok(packet) = client_cap.next() {
+            let pkt = PacketHeaders::from_ethernet_slice(&packet)
+                .expect("Failed to decode packet");
+            //debug!("Everything: {:?}", pkt);
 
-        let ip_src: [u8;4];
-        let ip_dst: [u8;4];
-
-        match pkt.ip.unwrap() {
-            Version6(_) => {
-                warn!("IPv6 packet captured, but not yet implemented");
-                continue;
-            }
-            Version4(ref value) => {
-                /* The next match stmt should come here. Will do when we break this out async */
-                ip_src = value.source;
-                ip_dst = value.destination;
+            let ip_src: [u8;4];
+            let ip_dst: [u8;4];
+            match pkt.ip.unwrap() {
+                Version6(_) => {
+                    warn!("IPv6 packet captured, but not yet implemented");
+                    continue;
+                }
+                Version4(ref value) => {
+                    ip_src = value.source;
+                    ip_dst = value.destination;
+                    match pkt.transport.unwrap() {
+                        Udp(_) => error!("UDP transport captured when TCP expected"),
+                        Tcp(ref value) => {
+                            match parse_sni(pkt.payload) {
+                                Err(_) => error!("Error parsing SNI"),
+                                Ok(sni) => {
+                                    debug!("Inserting client_cache entry: {:?} sni: {:?}",
+                                           derive_cache_key(&ip_src, &ip_dst, &value.source_port), sni);
+                                    client_cache_cl_ptr.lock().unwrap().insert(
+                                        derive_cache_key(&ip_src, &ip_dst, &value.source_port), ClientCacheEntry {
+                                        ts: SystemTime::now(),
+                                        sni: sni,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
-        //debug!("IP_src: {:?}", ip_src);
-        //debug!("IP_dst: {:?}", ip_dst);
+    });
+    threads.push(client_4_thr);
 
-        match pkt.transport.unwrap() {
-            Udp(_) => error!("UDP transport captured when TCP expected"),
-            Tcp(ref value) => {
-                //debug!("tcp_port: {:?}", tcp_port);
-                match parse_sni(pkt.payload) {
-                    Err(_) => error!("Error parsing SNI"),
-                    Ok(sni) => {
-                        debug!("Inserting client_cache entry: {:?} sni: {:?}", derive_cache_key(&ip_src, &ip_dst, &value.source_port), sni);
-                        client_cache.insert(derive_cache_key(&ip_src, &ip_dst, &value.source_port), ClientCacheEntry {
-                            ts: SystemTime::now(),
-                            sni: sni,
-                        });
+    let server_4_thr = thread::spawn(move || {
+        // ACK == 1 && RST == 0 && SYN == 0 && FIN == 0 && must accept TCP fragments
+        let bpf_server_4 = "tcp and src port 443 and (tcp[tcpflags] & tcp-ack = 16) and (tcp[tcpflags] & tcp-syn != 2) and 
+        (tcp[tcpflags] & tcp-fin != 1) and (tcp[tcpflags] & tcp-rst != 1)";
 
-                        while let Ok(resp_packet) = server_cap.next() {
-                            let resp_pkt = PacketHeaders::from_ethernet_slice(&resp_packet)
-                                .expect("Failed to decode resp_packet");
-                            //debug!("Everything: {:?}", resp_pkt);
+        let mut server_cap = Device::lookup().unwrap().open().unwrap();
+        match server_cap.filter(bpf_server_4){
+            Ok(_) => (),
+            Err(err) => error!("BPF error {}", err.to_string()),
+        }
 
-                            /* pcap/Etherparse strips the Ethernet FCS before it hands the packet to us.
-                            So a 60 byte packet was 64 bytes on the wire.
-                            Etherparse interprets any Ethernet padding as TCP data. I consider this a bug.
-                            Therefore, we ignore any packet 60 bytes or less to prevent us from storing erroneous TCP payloads.
-                            The chances of us actually needing that small of a packet are close to zero. */
-                            if resp_packet.len() <= 60 {
-                                continue;
-                            }
-                            let resp_ip_src: [u8;4];
-                            let resp_ip_dst: [u8;4];
+        while let Ok(resp_packet) = server_cap.next() {
+            let resp_pkt = PacketHeaders::from_ethernet_slice(&resp_packet)
+                .expect("Failed to decode resp_packet");
+            //debug!("Everything: {:?}", resp_pkt);
 
-                            match resp_pkt.ip.unwrap() {
-                                Version6(_) => {
-                                    warn!("IPv6 packet captured, but not yet implemented");
-                                    continue;
-                                }
-                                Version4(ref value) => {
-                                    /* The next match stmt should come here. Will do when we break this out async */
-                                    resp_ip_src = value.source;
-                                    resp_ip_dst = value.destination;
-                                }
-                            }
-                            //debug!("resp_IP_src: {:?}", resp_ip_src);
-                            //debug!("resp_IP_dst: {:?}", resp_ip_dst);
+            /* pcap/Etherparse strips the Ethernet FCS before it hands the packet to us.
+            So a 60 byte packet was 64 bytes on the wire.
+            Etherparse interprets any Ethernet padding as TCP data. I consider this a bug.
+            Therefore, we ignore any packet 60 bytes or less to prevent us from storing erroneous TCP payloads.
+            The chances of us actually needing that small of a packet are close to zero. */
+            if resp_packet.len() <= 60 {
+                continue;
+            }
+            let resp_ip_src: [u8;4];
+            let resp_ip_dst: [u8;4];
 
-                            match resp_pkt.transport.unwrap() {
-                                Udp(_) => warn!("UDP transport captured when TCP expected"),
-                                Tcp(ref tcp) => {
-                                    debug!("resp_tcp_seq: {:?}", tcp.sequence_number);
-                                    debug!("payload_len: {:?}", resp_pkt.payload.len());
+            match resp_pkt.ip.unwrap() {
+                Version6(_) => {
+                    warn!("IPv6 packet captured, but not yet implemented");
+                    continue;
+                }
+                Version4(ref value) => {
+                    resp_ip_src = value.source;
+                    resp_ip_dst = value.destination;
+                    match resp_pkt.transport.unwrap() {
+                        Udp(_) => warn!("UDP transport captured when TCP expected"),
+                        Tcp(ref tcp) => {
+                            debug!("resp_tcp_seq: {:?}", tcp.sequence_number);
+                            debug!("payload_len: {:?}", resp_pkt.payload.len());
+                            let key = derive_cache_key(&resp_ip_dst, &resp_ip_src, &tcp.destination_port);
+                            if client_cache_sr_ptr.lock().unwrap().contains_key(&key) {
+                                debug!("Found client_cache key {:?}", key);
 
-                                    let key = derive_cache_key(&resp_ip_dst, &resp_ip_src, &tcp.destination_port);
-                                    if client_cache.contains_key(&key) {
-                                        debug!("Found client_cache key {:?}", key);
-                                        /* The Certificate TLS message may not be the first TLS message we receive.
-                                        It will also likely span multiple TCP packets. Thus we need to test every payload
-                                        received to see if it is complete, if not we need to store it until we get the
-                                        next segment and test completeness again. If it is complete, but still not a
-                                        Certificate TLS message we need to flush cache and start waiting again. */
-                                        match server_cache.get(&key) {
-                                            Some(ref entry) => {
-                                                if entry.cert_chain.len() > 0 {
-                                                    debug!("Ignoring server_cache key {:?}", key);
-                                                    continue;
-                                                }
+                                /* The Certificate TLS message may not be the first TLS message we receive.
+                                It will also likely span multiple TCP packets. Thus we need to test every payload
+                                received to see if it is complete, if not we need to store it until we get the
+                                next segment and test completeness again. If it is complete, but still not a
+                                Certificate TLS message we need to flush cache and start waiting again. */
+                                match server_cache.get(&key) {
+                                    Some(ref entry) => {
+                                        if entry.cert_chain.len() > 0 {
+                                            debug!("Ignoring server_cache key {:?}", key);
+                                            continue;
+                                        }
 
-                                                debug!("Found server_cache key {:?}", key);
-                                                let mut raw_tls = entry.data.clone();
-                                                raw_tls.extend_from_slice(&resp_pkt.payload);
-                                                match parse_cert(&raw_tls[..]) {
-                                                    Ok(cert_chain) => {
-                                                        debug!("cert_len: {:?}", cert_chain.len());
-                                                        debug!("Finalizing server_cache entry: {:?}", key);
-                                                        server_cache.insert(key, ServerCacheEntry {
-                                                            ts: SystemTime::now(),
-                                                            seq: 0,
-                                                            data: Vec::new(),
-                                                            cert_chain: cert_chain.clone(),
-                                                        });
-                                                    }
-                                                    Err(err) => {
-                                                        match err {
-                                                            CertParseError::IncompleteTlsRecord | CertParseError::WrongTlsRecord => {
-                                                                if entry.seq == tcp.sequence_number {
-                                                                    debug!("Updating server_cache entry: {:?}", key);
-                                                                    server_cache.insert(key, ServerCacheEntry {
-                                                                        ts: SystemTime::now(),
-                                                                        seq: tcp.sequence_number + resp_pkt.payload.len() as u32,
-                                                                        data: raw_tls,
-                                                                        cert_chain: Vec::new(),
-                                                                    });
-                                                                }else{
-                                                                    debug!("Out-of-order TCP datagrams detected"); // TODO
-                                                                }
-                                                            }
+                                        debug!("Found server_cache key {:?}", key);
+                                        let mut raw_tls = entry.data.clone();
+                                        raw_tls.extend_from_slice(&resp_pkt.payload);
+                                        match parse_cert(&raw_tls[..]) {
+                                            Ok(cert_chain) => {
+                                                debug!("cert_len: {:?}", cert_chain.len());
+                                                debug!("Finalizing server_cache entry: {:?}", key);
+                                                server_cache.insert(key, ServerCacheEntry {
+                                                    ts: SystemTime::now(),
+                                                    seq: 0,
+                                                    data: Vec::new(),
+                                                    cert_chain: cert_chain.clone(),
+                                                });
+                                            }
+                                            Err(err) => {
+                                                match err {
+                                                    CertParseError::IncompleteTlsRecord | CertParseError::WrongTlsRecord => {
+                                                        if entry.seq == tcp.sequence_number {
+                                                            debug!("Updating server_cache entry: {:?}", key);
+                                                            server_cache.insert(key, ServerCacheEntry {
+                                                                ts: SystemTime::now(),
+                                                                seq: tcp.sequence_number + resp_pkt.payload.len() as u32,
+                                                                data: raw_tls,
+                                                                cert_chain: Vec::new(),
+                                                            });
+                                                        }else{
+                                                            debug!("Out-of-order TCP datagrams detected"); // TODO
                                                         }
                                                     }
                                                 }
                                             }
-                                            _ => {
-                                                debug!("No server_cache key {:?}", key);
-                                                match parse_cert(&resp_pkt.payload) {
-                                                    Ok(cert_chain) => {
-                                                        debug!("cert_len: {:?}", cert_chain.len());
-                                                        debug!("Finalizing server_cache entry: {:?}", key);
+                                        }
+                                    }
+                                    _ => {
+                                        debug!("No server_cache key {:?}", key);
+                                        match parse_cert(&resp_pkt.payload) {
+                                            Ok(cert_chain) => {
+                                                debug!("cert_len: {:?}", cert_chain.len());
+                                                debug!("Finalizing server_cache entry: {:?}", key);
+                                                server_cache.insert(key, ServerCacheEntry {
+                                                    ts: SystemTime::now(),
+                                                    seq: 0,
+                                                    data: Vec::new(),
+                                                    cert_chain: cert_chain.clone(),
+                                                });
+                                            }
+                                            Err(err)=> {
+                                                match err {
+                                                    CertParseError::IncompleteTlsRecord | CertParseError::WrongTlsRecord => {
+                                                        debug!("Inserting server_cache entry: {:?}", key);
                                                         server_cache.insert(key, ServerCacheEntry {
                                                             ts: SystemTime::now(),
-                                                            seq: 0,
-                                                            data: Vec::new(),
-                                                            cert_chain: cert_chain.clone(),
+                                                            seq: tcp.sequence_number + resp_pkt.payload.len() as u32,
+                                                            data: resp_pkt.payload.to_vec(),
+                                                            cert_chain: Vec::new(),
                                                         });
-                                                    }
-                                                    Err(err)=> {
-                                                        match err {
-                                                            CertParseError::IncompleteTlsRecord | CertParseError::WrongTlsRecord => {
-                                                                debug!("Inserting server_cache entry: {:?}", key);
-                                                                server_cache.insert(key, ServerCacheEntry {
-                                                                    ts: SystemTime::now(),
-                                                                    seq: tcp.sequence_number + resp_pkt.payload.len() as u32,
-                                                                    data: resp_pkt.payload.to_vec(),
-                                                                    cert_chain: Vec::new(),
-                                                                });
-                                                            }
-                                                        }
                                                     }
                                                 }
                                             }
@@ -239,7 +238,13 @@ fn main() {
                 }
             }
         }
+    });
+    threads.push(server_4_thr);
+
+    for thr in threads {
+        thr.join().unwrap();
     }
+
     info!("Finish");
 }
 
