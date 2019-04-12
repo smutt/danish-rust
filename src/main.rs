@@ -93,7 +93,7 @@ fn main() {
                             }
                             match resolv_conf_parsed.nameservers[ii] {
                                 ScopedIp::V4(ip) => {
-                                    break ip.to_string().to_owned().clone() + ":53";
+                                    break ip.to_string() + ":53";
                                 }
                                 ScopedIp::V6(ref _ip, ref _scope) => (),
                             }
@@ -137,17 +137,18 @@ fn main() {
                                                     client_cache_cl_ptr.lock().unwrap().insert(
                                                         derive_cache_key(&ip_src, &ip_dst, &value.source_port), ClientCacheEntry {
                                                             ts: SystemTime::now(),
-                                                            sni: sni,
+                                                            sni: sni.clone(),
                                                         });
 
-                                                    let name = Name::from_str("_443._tcp.www.metafarce.com.").unwrap();
+                                                    let qname = "_443._tcp.".to_owned() + &sni.clone();
+                                                    let name = Name::from_str(&qname).unwrap();
                                                     let response: DnsResponse = client.query(&name, DNSClass::IN, RecordType::TLSA).unwrap();
                                                     let answers: &[Record] = response.answers();
                                                     if answers.len() == 0 {
-                                                        debug!("NOERROR or NXDOMAIN");
+                                                        debug!("TLSA query returned NOERROR or NXDOMAIN");
                                                     } else {
                                                         for answer in answers {
-                                                            debug!("derps: {:?}", answer.rdata());
+                                                            debug!("{:?}", answer.rdata());
                                                         }
                                                     }
                                                 }
