@@ -51,14 +51,15 @@ enum SniParseError {
 struct ClientCacheEntry {
     ts: SystemTime, // Last touched timestamp
     sni: String, // SNI
+    tlsa: Option<Vec<trust_dns::rr::rdata::TLSA>>, // DNS TLSA RRSET
 }
 
 #[derive(Debug, Clone)]
 struct ServerCacheEntry {
     ts: SystemTime, // Last touched timestamp
-    seq: u32, // TCP sequence number for reassembly
-    data: Vec<u8>, // TCP fragment for reassembly
-    cert_chain: Vec<Vec<u8>>, // DER-encoded X.509 certificates
+    seq: Option<u32>, // TCP sequence number for reassembly
+    data: Option<Vec<u8>>, // TCP fragment for reassembly
+    cert_chain: Option<Vec<Vec<u8>>>, // DER-encoded X.509 certificates
 }
 
 fn main() {
@@ -138,6 +139,7 @@ fn main() {
                                                         derive_cache_key(&ip_src, &ip_dst, &value.source_port), ClientCacheEntry {
                                                             ts: SystemTime::now(),
                                                             sni: sni.clone(),
+                                                            tlsa: None,
                                                         });
 
                                                     let qname = "_443._tcp.".to_owned() + &sni.clone();
@@ -203,8 +205,8 @@ fn main() {
                     match resp_pkt.transport.unwrap() {
                         Udp(_) => warn!("UDP transport captured when TCP expected"),
                         Tcp(ref tcp) => {
-                            debug!("resp_tcp_seq: {:?}", tcp.sequence_number);
-                            debug!("payload_len: {:?}", resp_pkt.payload.len());
+                            //debug!("resp_tcp_seq: {:?}", tcp.sequence_number);
+                            //debug!("payload_len: {:?}", resp_pkt.payload.len());
                             let key = derive_cache_key(&resp_ip_dst, &resp_ip_src, &tcp.destination_port);
                             if client_cache_sr_ptr.lock().unwrap().contains_key(&key) {
                                 debug!("Found client_cache key {:?}", key);
@@ -216,35 +218,35 @@ fn main() {
                                 Certificate TLS message we need to flush cache and start waiting again. */
                                 match server_cache.get(&key) {
                                     Some(ref entry) => {
-                                        if entry.cert_chain.len() > 0 {
+                                        if entry.cert_chain.is_some() {
                                             debug!("Ignoring server_cache key {:?}", key);
                                             continue;
                                         }
 
                                         debug!("Found server_cache key {:?}", key);
-                                        let mut raw_tls = entry.data.clone();
+                                        let mut raw_tls = entry.data.clone().unwrap();
                                         raw_tls.extend_from_slice(&resp_pkt.payload);
                                         match parse_cert(&raw_tls[..]) {
                                             Ok(cert_chain) => {
-                                                debug!("cert_len: {:?}", cert_chain.len());
+                                                debug!("TLS cert found, len: {:?}", cert_chain.len());
                                                 debug!("Finalizing server_cache entry: {:?}", key);
                                                 server_cache.insert(key, ServerCacheEntry {
                                                     ts: SystemTime::now(),
-                                                    seq: 0,
-                                                    data: Vec::new(),
-                                                    cert_chain: cert_chain.clone(),
+                                                    seq: None,
+                                                    data: None,
+                                                    cert_chain: Some(cert_chain.clone()),
                                                 });
                                             }
                                             Err(err) => {
                                                 match err {
                                                     CertParseError::IncompleteTlsRecord | CertParseError::WrongTlsRecord => {
-                                                        if entry.seq == tcp.sequence_number {
+                                                        if entry.seq.unwrap() == tcp.sequence_number {
                                                             debug!("Updating server_cache entry: {:?}", key);
                                                             server_cache.insert(key, ServerCacheEntry {
                                                                 ts: SystemTime::now(),
-                                                                seq: tcp.sequence_number + resp_pkt.payload.len() as u32,
-                                                                data: raw_tls,
-                                                                cert_chain: Vec::new(),
+                                                                seq: Some(tcp.sequence_number + resp_pkt.payload.len() as u32),
+                                                                data: Some(raw_tls),
+                                                                cert_chain: None,
                                                             });
                                                         }else{
                                                             debug!("Out-of-order TCP datagrams detected"); // TODO
@@ -262,9 +264,9 @@ fn main() {
                                                 debug!("Finalizing server_cache entry: {:?}", key);
                                                 server_cache.insert(key, ServerCacheEntry {
                                                     ts: SystemTime::now(),
-                                                    seq: 0,
-                                                    data: Vec::new(),
-                                                    cert_chain: cert_chain.clone(),
+                                                    seq: None,
+                                                    data: None,
+                                                    cert_chain: Some(cert_chain.clone()),
                                                 });
                                             }
                                             Err(err)=> {
@@ -273,9 +275,9 @@ fn main() {
                                                         debug!("Inserting server_cache entry: {:?}", key);
                                                         server_cache.insert(key, ServerCacheEntry {
                                                             ts: SystemTime::now(),
-                                                            seq: tcp.sequence_number + resp_pkt.payload.len() as u32,
-                                                            data: resp_pkt.payload.to_vec(),
-                                                            cert_chain: Vec::new(),
+                                                            seq: Some(tcp.sequence_number + resp_pkt.payload.len() as u32),
+                                                            data: Some(resp_pkt.payload.to_vec()),
+                                                            cert_chain: None,
                                                         });
                                                     }
                                                 }
