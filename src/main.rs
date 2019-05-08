@@ -26,7 +26,7 @@ use tls_parser::tls_extensions;
 use trust_dns::client::{Client, SyncClient};
 use trust_dns::udp::UdpClientConnection;
 use trust_dns::op::DnsResponse;
-use trust_dns::rr::{DNSClass, Name, Record, RecordType};
+use trust_dns::rr::{DNSClass, Name, RecordType};
 use resolv_conf::{Config, ScopedIp};
 //use iptables;
 
@@ -51,7 +51,8 @@ enum SniParseError {
 struct ClientCacheEntry {
     ts: SystemTime, // Last touched timestamp
     sni: String, // SNI
-    tlsa: Option<Vec<trust_dns::rr::rdata::TLSA>>, // DNS TLSA RRSET
+    tlsa: Option<Vec<trust_dns::rr::RData>>, // DNS TLSA RRSET
+    response: bool, // Have we queried and gotten a response yet?
 }
 
 #[derive(Debug, Clone)]
@@ -133,23 +134,42 @@ fn main() {
                                             match parse_sni(pkt.payload) {
                                                 Err(_) => error!("Error parsing SNI"),
                                                 Ok(sni) => {
-                                                    debug!("Inserting client_cache entry: {:?} sni: {:?}",
-                                                           derive_cache_key(&ip_src, &ip_dst, &value.source_port), sni);
+                                                    let key = derive_cache_key(&ip_src, &ip_dst, &value.source_port);
+                                                    debug!("Inserting client_cache entry: {:?} sni: {:?}", key, sni);
                                                     client_cache_cl_ptr.lock().unwrap().insert(
-                                                        derive_cache_key(&ip_src, &ip_dst, &value.source_port), ClientCacheEntry {
+                                                        derive_cache_key(&ip_src, &ip_dst, &value.source_port),
+                                                        ClientCacheEntry {
                                                             ts: SystemTime::now(),
                                                             sni: sni.clone(),
                                                             tlsa: None,
+                                                            response: false,
                                                         });
 
                                                     let qname = "_443._tcp.".to_owned() + &sni.clone();
                                                     let name = Name::from_str(&qname).unwrap();
                                                     let response: DnsResponse = client.query(&name, DNSClass::IN, RecordType::TLSA).unwrap();
-                                                    let answers: &[Record] = response.answers();
-                                                    if answers.len() == 0 {
-                                                        debug!("TLSA query returned NOERROR or NXDOMAIN");
+                                                    debug!("{:?}", response);
+                                                    if response.answers().len() == 0 { // TODO: Get smarter about recognizing NXDOMAIN
+                                                        debug!("{:?} TLSA returned NXDOMAIN", qname);
+                                                        client_cache_cl_ptr.lock().unwrap().remove(&key);
+                                                        client_cache_cl_ptr.lock().unwrap().insert(key, ClientCacheEntry {
+                                                            ts: SystemTime::now(),
+                                                            sni: sni.clone(),
+                                                            tlsa: None,
+                                                            response: true,
+                                                        });
                                                     } else {
-                                                        for answer in answers {
+                                                        debug!("{:?} TLSA returned RRSET", qname);
+                                                        client_cache_cl_ptr.lock().unwrap().remove(&key);
+                                                        client_cache_cl_ptr.lock().unwrap().insert(key, ClientCacheEntry {
+                                                            ts: SystemTime::now(),
+                                                            sni: sni.clone(),
+                                                            tlsa: Some(
+                                                                response.answers().iter().map(|rr| rr.rdata().clone()).collect::<Vec<_>>()
+                                                            ),
+                                                            response: true,
+                                                        });
+                                                        for answer in response.answers() {
                                                             debug!("{:?}", answer.rdata());
                                                         }
                                                     }
