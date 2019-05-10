@@ -10,13 +10,13 @@ extern crate trust_dns;
 extern crate resolv_conf;
 
 use std::str::FromStr;
-use std::thread;
+use std::{time, thread};
+use std::time::SystemTime;
 use std::io::prelude::*;
 use std::fs::File;
 use std::path::Path;
 use std::sync::{Mutex, Arc};
 use std::collections::HashMap;
-use std::time::SystemTime;
 use pcap::Device;
 use etherparse::PacketHeaders;
 use etherparse::IpHeader::*;
@@ -29,6 +29,9 @@ use trust_dns::op::DnsResponse;
 use trust_dns::rr::{DNSClass, Name, RecordType};
 use resolv_conf::{Config, ScopedIp};
 //use iptables;
+
+// CONSTANTS
+const DNS_TIMEOUT: u32 = 1000; // Timeout for DNS queries in milliseconds, must be divisible by 100
 
 //Types of errors we can generate from parse_cert()
 #[derive(Debug)]
@@ -145,6 +148,7 @@ fn main() {
                                                             response: false,
                                                         });
 
+                                                    // TODO: Perform DNS lookups asynchronously
                                                     let qname = "_443._tcp.".to_owned() + &sni.clone();
                                                     let name = Name::from_str(&qname).unwrap();
                                                     let response: DnsResponse = client.query(&name, DNSClass::IN, RecordType::TLSA).unwrap();
@@ -158,7 +162,7 @@ fn main() {
                                                             tlsa: None,
                                                             response: true,
                                                         });
-                                                    } else {
+                                                    }else{
                                                         debug!("{:?} TLSA returned RRSET", qname);
                                                         client_cache_cl_ptr.lock().unwrap().remove(&key);
                                                         client_cache_cl_ptr.lock().unwrap().insert(key, ClientCacheEntry {
@@ -250,11 +254,15 @@ fn main() {
                                             Ok(cert_chain) => {
                                                 debug!("TLS cert found, len: {:?}", cert_chain.len());
                                                 debug!("Finalizing server_cache entry: {:?}", key);
-                                                server_cache.insert(key, ServerCacheEntry {
+                                                server_cache.insert(key.clone(), ServerCacheEntry {
                                                     ts: SystemTime::now(),
                                                     seq: None,
                                                     data: None,
                                                     cert_chain: Some(cert_chain.clone()),
+                                                });
+                                                let cl_entry = client_cache_sr_ptr.lock().unwrap().get(&key).unwrap().clone();
+                                                thread::spawn(move || {
+                                                    handle_validation(&cl_entry, &cert_chain, DNS_TIMEOUT);
                                                 });
                                             }
                                             Err(err) => {
@@ -262,7 +270,7 @@ fn main() {
                                                     CertParseError::IncompleteTlsRecord | CertParseError::WrongTlsRecord => {
                                                         if entry.seq.unwrap() == tcp.sequence_number {
                                                             debug!("Updating server_cache entry: {:?}", key);
-                                                            server_cache.insert(key, ServerCacheEntry {
+                                                            server_cache.insert(key.clone(), ServerCacheEntry {
                                                                 ts: SystemTime::now(),
                                                                 seq: Some(tcp.sequence_number + resp_pkt.payload.len() as u32),
                                                                 data: Some(raw_tls),
@@ -282,11 +290,15 @@ fn main() {
                                             Ok(cert_chain) => {
                                                 debug!("cert_len: {:?}", cert_chain.len());
                                                 debug!("Finalizing server_cache entry: {:?}", key);
-                                                server_cache.insert(key, ServerCacheEntry {
+                                                server_cache.insert(key.clone(), ServerCacheEntry {
                                                     ts: SystemTime::now(),
                                                     seq: None,
                                                     data: None,
                                                     cert_chain: Some(cert_chain.clone()),
+                                                });
+                                                let cl_entry = client_cache_sr_ptr.lock().unwrap().get(&key).unwrap().clone();
+                                                thread::spawn(move || {
+                                                    handle_validation(&cl_entry, &cert_chain, DNS_TIMEOUT);
                                                 });
                                             }
                                             Err(err)=> {
@@ -334,6 +346,42 @@ fn read_resolv_conf() -> Result<String, std::io::Error> {
     let mut contents = String::new();
     handle.read_to_string(&mut contents)?;
     return Ok(contents);
+}
+
+// Called once everything has been been received from the network
+// Determines validation disposition and installs ACLs if necessary
+// Takes a ClientCacheEntry, the X.509 DER encoded cert chain, and milliseconds to wait until DNS response
+fn handle_validation(c_cache: &ClientCacheEntry, cert_chain: &Vec<Vec<u8>>, timeout: u32) {
+    debug!("Entered handle_validation {:?} {:?}", c_cache, timeout);
+    if c_cache.response == true {
+        if c_cache.tlsa != None {
+            if validate_tlsa(&c_cache.tlsa.clone().unwrap(), cert_chain) {
+                debug!("TLSA for {:?} validated", c_cache.sni);
+                return;
+            }else{
+                debug!("TLSA for {:?} invalid", c_cache.sni);
+                return;
+            }
+        }else{
+            debug!("TLSA for {:?} nonexistant", c_cache.sni);
+        }
+    }else{
+        if timeout == 0 {
+            return;
+        }else{
+            thread::sleep(time::Duration::from_millis(100));
+            handle_validation(c_cache, cert_chain, timeout - 100);
+        }
+    }
+}
+
+
+// Validates X.509 cert against TLSA 
+// Takes RData of DNS TLSA RRSET and DER encoded X.509 cert chain
+// Returns True on valid and False on invalid
+fn validate_tlsa(rdata: &Vec<trust_dns::rr::RData>, cert_chain: &Vec<Vec<u8>>) -> bool {
+    debug!("Entered validate_tlsa() rdata: {:?} cert_chain: {:?}", rdata, cert_chain);
+    return true;
 }
 
 // Parse the X.509 cert from TLS ServerHello Messages
