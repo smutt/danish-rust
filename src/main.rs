@@ -53,7 +53,7 @@ enum SniParseError {
 }
 
 #[derive(Debug, Clone)]
-struct ClientCacheEntry {
+struct ClientCacheEntry { // TODO: Implement staleness
     ts: SystemTime, // Last touched timestamp
     sni: String, // SNI
     tlsa: Option<Vec<trust_dns::rr::RData>>, // DNS TLSA RRSET
@@ -61,7 +61,7 @@ struct ClientCacheEntry {
 }
 
 #[derive(Debug, Clone)]
-struct ServerCacheEntry {
+struct ServerCacheEntry { // TODO: Implement staleness
     ts: SystemTime, // Last touched timestamp
     seq: Option<u32>, // TCP sequence number for reassembly
     data: Option<Vec<u8>>, // TCP fragment for reassembly
@@ -273,6 +273,7 @@ fn main() {
                                                                 }
                                                                 _ => {
                                                                     debug!("TLSA for {:?} nonexistant", sni);
+                                                                    break;
                                                                 }
                                                             }
                                                         }else{
@@ -327,6 +328,7 @@ fn main() {
                                                                 }
                                                                 _ => {
                                                                     debug!("TLSA for {:?} nonexistant", sni);
+                                                                    break;
                                                                 }
                                                             }
                                                         }else{
@@ -394,6 +396,7 @@ fn handle_validation(sni: &String, tlsa: &Vec<trust_dns::rr::RData>, cert_chain:
         return;
     }else{
         debug!("TLSA for {:?} invalid", sni);
+        // Install some ACLs
         return;
     }
 }
