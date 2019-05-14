@@ -15,7 +15,8 @@ use std::time::SystemTime;
 use std::io::prelude::*;
 use std::fs::File;
 use std::path::Path;
-use std::sync::{Mutex, Arc};
+use std::sync::Arc;
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use pcap::Device;
 use etherparse::PacketHeaders;
@@ -31,7 +32,8 @@ use resolv_conf::{Config, ScopedIp};
 //use iptables;
 
 // CONSTANTS
-const DNS_TIMEOUT: u32 = 1000; // Timeout for DNS queries in milliseconds, must be divisible by 100
+const DNS_TIMEOUT: u64 = 1000; // Timeout for DNS queries in milliseconds, must be divisible by DNS_TIMEOUT_DECREMENT
+const DNS_TIMEOUT_DECREMENT: u64 = 20; // Decrement for counting down to zero from DNS_TIMEOUT in milliseconds
 
 //Types of errors we can generate from parse_cert()
 #[derive(Debug)]
@@ -77,10 +79,8 @@ fn main() {
     let mut threads = vec![]; // Our threads
 
     // Setup our cache
-    let client_cache = Arc::new(Mutex::new(HashMap::<String, ClientCacheEntry>::new()));
-    let client_cache_cl_ptr = Arc::clone(&client_cache);
-    let client_cache_sr_ptr = Arc::clone(&client_cache);
-    //let mut client_cache: HashMap<String, ClientCacheEntry> = HashMap::new();
+    let client_cache = Arc::new(RwLock::new(HashMap::<String, ClientCacheEntry>::new()));
+    let client_cache_srv = Arc::clone(&client_cache);
     let mut server_cache: HashMap<String, ServerCacheEntry> = HashMap::new();
 
     let client_4_thr = thread::spawn(move || {
@@ -139,7 +139,7 @@ fn main() {
                                                 Ok(sni) => {
                                                     let key = derive_cache_key(&ip_src, &ip_dst, &value.source_port);
                                                     debug!("Inserting client_cache entry: {:?} sni: {:?}", key, sni);
-                                                    client_cache_cl_ptr.lock().unwrap().insert(
+                                                    client_cache.write().insert(
                                                         derive_cache_key(&ip_src, &ip_dst, &value.source_port),
                                                         ClientCacheEntry {
                                                             ts: SystemTime::now(),
@@ -152,20 +152,19 @@ fn main() {
                                                     let qname = "_443._tcp.".to_owned() + &sni.clone();
                                                     let name = Name::from_str(&qname).unwrap();
                                                     let response: DnsResponse = client.query(&name, DNSClass::IN, RecordType::TLSA).unwrap();
-                                                    debug!("{:?}", response);
+                                                    debug!("DNS Response {:?}", response);
                                                     if response.answers().len() == 0 { // TODO: Get smarter about recognizing NXDOMAIN
                                                         debug!("{:?} TLSA returned NXDOMAIN", qname);
-                                                        client_cache_cl_ptr.lock().unwrap().remove(&key);
-                                                        client_cache_cl_ptr.lock().unwrap().insert(key, ClientCacheEntry {
+                                                        client_cache.write().insert(key, ClientCacheEntry {
                                                             ts: SystemTime::now(),
                                                             sni: sni.clone(),
                                                             tlsa: None,
                                                             response: true,
                                                         });
+                                                        debug!("Updated client_cache {:?}", client_cache.read());
                                                     }else{
                                                         debug!("{:?} TLSA returned RRSET", qname);
-                                                        client_cache_cl_ptr.lock().unwrap().remove(&key);
-                                                        client_cache_cl_ptr.lock().unwrap().insert(key, ClientCacheEntry {
+                                                        client_cache.write().insert(key, ClientCacheEntry {
                                                             ts: SystemTime::now(),
                                                             sni: sni.clone(),
                                                             tlsa: Some(
@@ -173,8 +172,9 @@ fn main() {
                                                             ),
                                                             response: true,
                                                         });
+                                                        debug!("Updated client_cache {:?}", client_cache.read());
                                                         for answer in response.answers() {
-                                                            debug!("{:?}", answer.rdata());
+                                                            debug!("RRSET returned {:?}", answer.rdata());
                                                         }
                                                     }
                                                 }
@@ -232,7 +232,7 @@ fn main() {
                             //debug!("resp_tcp_seq: {:?}", tcp.sequence_number);
                             //debug!("payload_len: {:?}", resp_pkt.payload.len());
                             let key = derive_cache_key(&resp_ip_dst, &resp_ip_src, &tcp.destination_port);
-                            if client_cache_sr_ptr.lock().unwrap().contains_key(&key) {
+                            if client_cache_srv.read().contains_key(&key) {
                                 debug!("Found client_cache key {:?}", key);
 
                                 /* The Certificate TLS message may not be the first TLS message we receive.
@@ -260,9 +260,27 @@ fn main() {
                                                     data: None,
                                                     cert_chain: Some(cert_chain.clone()),
                                                 });
-                                                let cl_entry = client_cache_sr_ptr.lock().unwrap().get(&key).unwrap().clone();
+                                                let cl_client = Arc::clone(&client_cache_srv);
                                                 thread::spawn(move || {
-                                                    handle_validation(&cl_entry, &cert_chain, DNS_TIMEOUT);
+                                                    let mut ii = DNS_TIMEOUT;
+                                                    while ii > 0 {
+                                                        if cl_client.read().get(&key).unwrap().response == true {
+                                                            let sni = cl_client.read().get(&key).unwrap().sni.clone();
+                                                            match cl_client.read().get(&key).unwrap().tlsa {
+                                                                Some(ref tlsa) => {
+                                                                    handle_validation(&sni, &tlsa, &cert_chain);
+                                                                    break;
+                                                                }
+                                                                _ => {
+                                                                    debug!("TLSA for {:?} nonexistant", sni);
+                                                                }
+                                                            }
+                                                        }else{
+                                                            thread::sleep(time::Duration::from_millis(DNS_TIMEOUT_DECREMENT));
+                                                            debug!("Slept {:?} ms awaiting DNS response", DNS_TIMEOUT_DECREMENT);
+                                                            ii = ii - DNS_TIMEOUT_DECREMENT;
+                                                        }
+                                                    }
                                                 });
                                             }
                                             Err(err) => {
@@ -296,9 +314,27 @@ fn main() {
                                                     data: None,
                                                     cert_chain: Some(cert_chain.clone()),
                                                 });
-                                                let cl_entry = client_cache_sr_ptr.lock().unwrap().get(&key).unwrap().clone();
+                                                let cl_client = Arc::clone(&client_cache_srv);
                                                 thread::spawn(move || {
-                                                    handle_validation(&cl_entry, &cert_chain, DNS_TIMEOUT);
+                                                    let mut ii = DNS_TIMEOUT;
+                                                    while ii > 0 {
+                                                        if cl_client.read().get(&key).unwrap().response == true {
+                                                            let sni = cl_client.read().get(&key).unwrap().sni.clone();
+                                                            match cl_client.read().get(&key).unwrap().tlsa {
+                                                                Some(ref tlsa) => {
+                                                                    handle_validation(&sni, &tlsa, &cert_chain);
+                                                                    break;
+                                                                }
+                                                                _ => {
+                                                                    debug!("TLSA for {:?} nonexistant", sni);
+                                                                }
+                                                            }
+                                                        }else{
+                                                            thread::sleep(time::Duration::from_millis(DNS_TIMEOUT_DECREMENT));
+                                                            debug!("Slept {:?} ms awaiting DNS response", DNS_TIMEOUT_DECREMENT);
+                                                            ii = ii - DNS_TIMEOUT_DECREMENT;
+                                                        }
+                                                    }
                                                 });
                                             }
                                             Err(err)=> {
@@ -351,36 +387,22 @@ fn read_resolv_conf() -> Result<String, std::io::Error> {
 // Called once everything has been been received from the network
 // Determines validation disposition and installs ACLs if necessary
 // Takes a ClientCacheEntry, the X.509 DER encoded cert chain, and milliseconds to wait until DNS response
-fn handle_validation(c_cache: &ClientCacheEntry, cert_chain: &Vec<Vec<u8>>, timeout: u32) {
-    debug!("Entered handle_validation {:?} {:?}", c_cache, timeout);
-    if c_cache.response == true {
-        if c_cache.tlsa != None {
-            if validate_tlsa(&c_cache.tlsa.clone().unwrap(), cert_chain) {
-                debug!("TLSA for {:?} validated", c_cache.sni);
-                return;
-            }else{
-                debug!("TLSA for {:?} invalid", c_cache.sni);
-                return;
-            }
-        }else{
-            debug!("TLSA for {:?} nonexistant", c_cache.sni);
-        }
+fn handle_validation(sni: &String, tlsa: &Vec<trust_dns::rr::RData>, cert_chain: &Vec<Vec<u8>>) {
+    debug!("Entered handle_validation {:?} {:?}", sni, tlsa);
+    if validate_tlsa(&tlsa.clone(), cert_chain) {
+        debug!("TLSA for {:?} validated", sni);
+        return;
     }else{
-        if timeout == 0 {
-            return;
-        }else{
-            thread::sleep(time::Duration::from_millis(100));
-            handle_validation(c_cache, cert_chain, timeout - 100);
-        }
+        debug!("TLSA for {:?} invalid", sni);
+        return;
     }
 }
-
 
 // Validates X.509 cert against TLSA 
 // Takes RData of DNS TLSA RRSET and DER encoded X.509 cert chain
 // Returns True on valid and False on invalid
-fn validate_tlsa(rdata: &Vec<trust_dns::rr::RData>, cert_chain: &Vec<Vec<u8>>) -> bool {
-    debug!("Entered validate_tlsa() rdata: {:?} cert_chain: {:?}", rdata, cert_chain);
+fn validate_tlsa(tlsa: &Vec<trust_dns::rr::RData>, cert_chain: &Vec<Vec<u8>>) -> bool {
+    debug!("Entered validate_tlsa() tlsa: {:?} cert_chain: {:?}", tlsa, cert_chain);
     return true;
 }
 
