@@ -28,6 +28,8 @@ use trust_dns::client::{Client, SyncClient};
 use trust_dns::udp::UdpClientConnection;
 use trust_dns::op::DnsResponse;
 use trust_dns::rr::{DNSClass, Name, RecordType};
+use trust_dns::rr::RData::TLSA;
+use trust_dns::rr::rdata::tlsa::{CertUsage, Matching, Selector};
 use resolv_conf::{Config, ScopedIp};
 //use iptables;
 
@@ -404,9 +406,87 @@ fn handle_validation(sni: &String, tlsa: &Vec<trust_dns::rr::RData>, cert_chain:
 // Validates X.509 cert against TLSA 
 // Takes RData of DNS TLSA RRSET and DER encoded X.509 cert chain
 // Returns True on valid and False on invalid
-fn validate_tlsa(tlsa: &Vec<trust_dns::rr::RData>, cert_chain: &Vec<Vec<u8>>) -> bool {
-    debug!("Entered validate_tlsa() tlsa: {:?} cert_chain: {:?}", tlsa, cert_chain);
-    return true;
+fn validate_tlsa(tlsa_rrset: &Vec<trust_dns::rr::RData>, cert_chain: &Vec<Vec<u8>>) -> bool {
+    debug!("Entered validate_tlsa() tlsa_rrset: {:?}", tlsa_rrset);
+    for rr in tlsa_rrset {
+        debug!("tlsa: {:?}", rr);
+        match rr{
+            TLSA(tlsa) => {
+                debug!("tlsa_matching: {:?}", tlsa.matching());
+                match tlsa.matching() { // TODO: Set hash algorithm here
+                    Matching::Sha256 => {
+                        debug!("256");
+                    }
+                    Matching::Sha512 => {
+                        debug!("512");
+                    }
+                    Matching::Raw => {
+                        debug!("raw");
+                    }
+                    _ => debug!("Unsupported TLSA::Matching"),
+                }
+
+                debug!("cert_usage {:?}", tlsa.cert_usage());
+                match tlsa.cert_usage() {
+                    CertUsage::CA => {
+                        debug!("CertUsage::CA");
+                        debug!("selector {:?}", tlsa.selector());
+                        match tlsa.selector() {
+                            Selector::Full => {
+                                debug!("Selector::Full");
+                            }
+                            Selector::Spki => {
+                                debug!("Selector::Spki");
+                            }
+                            _ => debug!("Unsupported TLSA::Selector"),
+                        }
+                    }
+                    CertUsage::Service => {
+                        debug!("CertUsage::Service");
+                        debug!("selector {:?}", tlsa.selector());
+                        match tlsa.selector() {
+                            Selector::Full => {
+                                debug!("Selector::Full");
+                            }
+                            Selector::Spki => {
+                                debug!("Selector::Spki");
+                            }
+                            _ => debug!("Unsupported TLSA::Selector"),
+                        }
+                    }
+                    CertUsage::TrustAnchor => {
+                        debug!("CertUsage::TrustAnchor");
+                        debug!("selector {:?}", tlsa.selector());
+                        match tlsa.selector() {
+                            Selector::Full => {
+                                debug!("Selector::Full");
+                            }
+                            Selector::Spki => {
+                                debug!("Selector::Spki");
+                            }
+                            _ => debug!("Unsupported TLSA::Selector"),
+                        }
+                    }
+                    CertUsage::DomainIssued => {
+                        debug!("CertUsage::DomainIssued");
+                        debug!("selector {:?}", tlsa.selector());
+                        match tlsa.selector() {
+                            Selector::Full => {
+                                debug!("Selector::Full");
+                            }
+                            Selector::Spki => {
+                                debug!("Selector::Spki");
+                            }
+                            _ => debug!("Unsupported TLSA::Selector"),
+                        }
+                    }
+                    _ => debug!("Unsupported TLSA::CertUsage"),
+                }
+            }
+            _ => debug!("RRSET contains non-TLSA RR"),
+        }
+    }
+    return false;
 }
 
 // Parse the X.509 cert from TLS ServerHello Messages
