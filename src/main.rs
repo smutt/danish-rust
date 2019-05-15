@@ -8,6 +8,7 @@ extern crate tls_parser;
 extern crate nom;
 extern crate trust_dns;
 extern crate resolv_conf;
+extern crate sha2;
 
 use std::str::FromStr;
 use std::{time, thread};
@@ -31,6 +32,7 @@ use trust_dns::rr::{DNSClass, Name, RecordType};
 use trust_dns::rr::RData::TLSA;
 use trust_dns::rr::rdata::tlsa::{CertUsage, Matching, Selector};
 use resolv_conf::{Config, ScopedIp};
+use sha2::{Sha256, Sha512, Digest};
 //use iptables;
 
 // CONSTANTS
@@ -413,15 +415,18 @@ fn validate_tlsa(tlsa_rrset: &Vec<trust_dns::rr::RData>, cert_chain: &Vec<Vec<u8
         match rr{
             TLSA(tlsa) => {
                 debug!("tlsa_matching: {:?}", tlsa.matching());
-                match tlsa.matching() { // TODO: Set hash algorithm here
+                match tlsa.matching() {
                     Matching::Sha256 => {
                         debug!("256");
+                        let mut hash_algo = Sha256::new();
                     }
                     Matching::Sha512 => {
                         debug!("512");
+                        let mut hash_algo = Sha512::new();
                     }
                     Matching::Raw => {
-                        debug!("raw");
+                        debug!("raw"); // TODO Actually do this right
+                        let mut hash_algo = Sha256::new();
                     }
                     _ => debug!("Unsupported TLSA::Matching"),
                 }
