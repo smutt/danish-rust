@@ -29,10 +29,10 @@ use trust_dns::client::{Client, SyncClient};
 use trust_dns::udp::UdpClientConnection;
 use trust_dns::op::DnsResponse;
 use trust_dns::rr::{DNSClass, Name, RecordType};
-use trust_dns::rr::RData::TLSA;
-use trust_dns::rr::rdata::tlsa::{CertUsage, Matching, Selector};
+//use trust_dns::rr::RData::TLSA;
+//use trust_dns::rr::rdata::tlsa::{CertUsage, Matching, Selector};
 use resolv_conf::{Config, ScopedIp};
-use sha2::{Sha256, Sha512, Digest};
+//use sha2::{Sha256, Sha512, Digest};
 //use iptables;
 
 // CONSTANTS
@@ -264,29 +264,8 @@ fn main() {
                                                     data: None,
                                                     cert_chain: Some(cert_chain.clone()),
                                                 });
-                                                let cl_client = Arc::clone(&client_cache_srv);
-                                                thread::spawn(move || {
-                                                    let mut ii = DNS_TIMEOUT;
-                                                    while ii > 0 {
-                                                        if cl_client.read().get(&key).unwrap().response == true {
-                                                            let sni = cl_client.read().get(&key).unwrap().sni.clone();
-                                                            match cl_client.read().get(&key).unwrap().tlsa {
-                                                                Some(ref tlsa) => {
-                                                                    handle_validation(&sni, &tlsa, &cert_chain);
-                                                                    break;
-                                                                }
-                                                                _ => {
-                                                                    debug!("TLSA for {:?} nonexistant", sni);
-                                                                    break;
-                                                                }
-                                                            }
-                                                        }else{
-                                                            thread::sleep(time::Duration::from_millis(DNS_TIMEOUT_DECREMENT));
-                                                            debug!("Slept {:?} ms awaiting DNS response", DNS_TIMEOUT_DECREMENT);
-                                                            ii = ii - DNS_TIMEOUT_DECREMENT;
-                                                        }
-                                                    }
-                                                });
+                                                handle_validation(Arc::clone(&client_cache_srv), cert_chain,
+                                                                  resp_ip_src, resp_ip_dst, tcp.destination_port);
                                             }
                                             Err(err) => {
                                                 match err {
@@ -319,29 +298,8 @@ fn main() {
                                                     data: None,
                                                     cert_chain: Some(cert_chain.clone()),
                                                 });
-                                                let cl_client = Arc::clone(&client_cache_srv);
-                                                thread::spawn(move || {
-                                                    let mut ii = DNS_TIMEOUT;
-                                                    while ii > 0 {
-                                                        if cl_client.read().get(&key).unwrap().response == true {
-                                                            let sni = cl_client.read().get(&key).unwrap().sni.clone();
-                                                            match cl_client.read().get(&key).unwrap().tlsa {
-                                                                Some(ref tlsa) => {
-                                                                    handle_validation(&sni, &tlsa, &cert_chain);
-                                                                    break;
-                                                                }
-                                                                _ => {
-                                                                    debug!("TLSA for {:?} nonexistant", sni);
-                                                                    break;
-                                                                }
-                                                            }
-                                                        }else{
-                                                            thread::sleep(time::Duration::from_millis(DNS_TIMEOUT_DECREMENT));
-                                                            debug!("Slept {:?} ms awaiting DNS response", DNS_TIMEOUT_DECREMENT);
-                                                            ii = ii - DNS_TIMEOUT_DECREMENT;
-                                                        }
-                                                    }
-                                                });
+                                                handle_validation(Arc::clone(&client_cache_srv), cert_chain,
+                                                                  resp_ip_src, resp_ip_dst, tcp.destination_port);
                                             }
                                             Err(err)=> {
                                                 match err {
@@ -390,26 +348,51 @@ fn read_resolv_conf() -> Result<String, std::io::Error> {
     return Ok(contents);
 }
 
+
 // Called once everything has been been received from the network
 // Determines validation disposition and installs ACLs if necessary
 // Takes a ClientCacheEntry, the X.509 DER encoded cert chain, and milliseconds to wait until DNS response
-fn handle_validation(sni: &String, tlsa: &Vec<trust_dns::rr::RData>, cert_chain: &Vec<Vec<u8>>) {
-    debug!("Entered handle_validation {:?} {:?}", sni, tlsa);
-    if validate_tlsa(&tlsa.clone(), cert_chain) {
-        debug!("TLSA for {:?} validated", sni);
-        return;
-    }else{
-        debug!("TLSA for {:?} invalid", sni);
-        // Install some ACLs
-        return;
-    }
+fn handle_validation (cl_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>, cert_chain: Vec<Vec<u8>>,
+                      src: [u8;4], dst: [u8;4], port: u16) {
+    debug!("Entered handle_validation {:?} {:?} {:?}", src, dst, port);
+
+    thread::spawn(move || {
+        let key = derive_cache_key(&dst, &src, &port);
+        let sni = cl_cache.read().get(&key).unwrap().sni.clone();
+        let mut ii = DNS_TIMEOUT;
+        while ii > 0 {
+            if cl_cache.read().get(&key).unwrap().response == true {
+                match cl_cache.read().get(&key).unwrap().tlsa {
+                    Some(ref tlsa) => {
+                        if validate_tlsa(&tlsa.clone(), &cert_chain) {
+                            debug!("TLSA for {:?} valid", sni);
+                        }else{
+                            debug!("TLSA for {:?} invalid", sni);
+                            // Install some ACLs
+                        }
+                        break;
+                    }
+                    _ => {
+                        debug!("TLSA for {:?} NXDOMAIN", sni);
+                        break;
+                    }
+                }
+            }else{
+                thread::sleep(time::Duration::from_millis(DNS_TIMEOUT_DECREMENT));
+                debug!("Slept {:?} ms awaiting DNS response", DNS_TIMEOUT_DECREMENT);
+                ii = ii - DNS_TIMEOUT_DECREMENT;
+            }
+        }
+    });
 }
+
 
 // Validates X.509 cert against TLSA 
 // Takes RData of DNS TLSA RRSET and DER encoded X.509 cert chain
 // Returns True on valid and False on invalid
-fn validate_tlsa(tlsa_rrset: &Vec<trust_dns::rr::RData>, cert_chain: &Vec<Vec<u8>>) -> bool {
+fn validate_tlsa(tlsa_rrset: &Vec<trust_dns::rr::RData>, _cert_chain: &Vec<Vec<u8>>) -> bool {
     debug!("Entered validate_tlsa() tlsa_rrset: {:?}", tlsa_rrset);
+    /*
     for rr in tlsa_rrset {
         debug!("tlsa: {:?}", rr);
         match rr{
@@ -491,6 +474,7 @@ fn validate_tlsa(tlsa_rrset: &Vec<trust_dns::rr::RData>, cert_chain: &Vec<Vec<u8
             _ => debug!("RRSET contains non-TLSA RR"),
         }
     }
+     */
     return false;
 }
 
@@ -555,6 +539,7 @@ fn parse_sni(payload: &[u8]) -> Result<String, SniParseError> {
 }
 
 // Derives a cache key from unique pairing of values
+// Source and destination are from perspective of TLS CLIENTHELLO
 fn derive_cache_key(src: &[u8;4], dst: &[u8;4], port: &u16) -> String {
     let delim = "_".to_string();
     let mut key = "".to_string();
