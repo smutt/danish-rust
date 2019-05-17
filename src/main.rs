@@ -29,10 +29,10 @@ use trust_dns::client::{Client, SyncClient};
 use trust_dns::udp::UdpClientConnection;
 use trust_dns::op::DnsResponse;
 use trust_dns::rr::{DNSClass, Name, RecordType};
-//use trust_dns::rr::RData::TLSA;
-//use trust_dns::rr::rdata::tlsa::{CertUsage, Matching, Selector};
+use trust_dns::rr::RData::TLSA;
+use trust_dns::rr::rdata::tlsa::{CertUsage, Matching, Selector};
 use resolv_conf::{Config, ScopedIp};
-//use sha2::{Sha256, Sha512, Digest};
+use sha2::{Sha256, Sha512, Digest};
 //use iptables;
 
 // CONSTANTS
@@ -349,9 +349,8 @@ fn read_resolv_conf() -> Result<String, std::io::Error> {
 }
 
 
-// Called once everything has been been received from the network
+// Kicks off TLSA validation thread once X.509 cert has been recieved
 // Determines validation disposition and installs ACLs if necessary
-// Takes a ClientCacheEntry, the X.509 DER encoded cert chain, and milliseconds to wait until DNS response
 fn handle_validation (cl_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>, cert_chain: Vec<Vec<u8>>,
                       src: [u8;4], dst: [u8;4], port: u16) {
     debug!("Entered handle_validation {:?} {:?} {:?}", src, dst, port);
@@ -390,83 +389,100 @@ fn handle_validation (cl_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>, 
 // Validates X.509 cert against TLSA 
 // Takes RData of DNS TLSA RRSET and DER encoded X.509 cert chain
 // Returns True on valid and False on invalid
-fn validate_tlsa(tlsa_rrset: &Vec<trust_dns::rr::RData>, _cert_chain: &Vec<Vec<u8>>) -> bool {
+fn validate_tlsa(tlsa_rrset: &Vec<trust_dns::rr::RData>, cert_chain: &Vec<Vec<u8>>) -> bool {
     debug!("Entered validate_tlsa() tlsa_rrset: {:?}", tlsa_rrset);
-    /*
+    let mut certs: Vec<Vec<u8>>;
     for rr in tlsa_rrset {
         debug!("tlsa: {:?}", rr);
         match rr{
             TLSA(tlsa) => {
-                debug!("tlsa_matching: {:?}", tlsa.matching());
-                match tlsa.matching() {
-                    Matching::Sha256 => {
-                        debug!("256");
-                        let mut hash_algo = Sha256::new();
+                match tlsa.selector() {
+                    Selector::Full => {
+                        debug!("Selector::Full");
+                        certs = cert_chain.clone();
                     }
-                    Matching::Sha512 => {
-                        debug!("512");
-                        let mut hash_algo = Sha512::new();
+                    Selector::Spki => {
+                        debug!("Selector::Spki");
+                        certs = cert_chain.clone();
                     }
-                    Matching::Raw => {
-                        debug!("raw"); // TODO Actually do this right
-                        let mut hash_algo = Sha256::new();
+                    _ => {
+                        debug!("Unsupported TLSA::Selector");
+                        certs = cert_chain.clone();
                     }
-                    _ => debug!("Unsupported TLSA::Matching"),
                 }
 
                 debug!("cert_usage {:?}", tlsa.cert_usage());
                 match tlsa.cert_usage() {
                     CertUsage::CA => {
-                        debug!("CertUsage::CA");
-                        debug!("selector {:?}", tlsa.selector());
-                        match tlsa.selector() {
-                            Selector::Full => {
-                                debug!("Selector::Full");
+/*                        debug!("tlsa_matching: {:?}", tlsa.matching());
+                        match tlsa.matching() {
+                            Matching::Sha256 => {
+                                for cert in certs {
+                                    if Sha256::digest(&cert) == tlsa.cert_data() {
+                                        return true;
+                                    }
+                                }
                             }
-                            Selector::Spki => {
-                                debug!("Selector::Spki");
+                            Matching::Sha512 => {
+                                for cert in certs {
+                                    if Sha512::digest(&cert) == tlsa.cert_data() {
+                                        return true;
+                                    }
+                                }
                             }
-                            _ => debug!("Unsupported TLSA::Selector"),
-                        }
+                            Matching::Raw => {
+                                for cert in certs {
+                                    if cert == tlsa.cert_data() {
+                                        return true;
+                                    }
+                                }
+                            }
+                            _ => debug!("Unsupported TLSA::Matching"),
+                        }*/
                     }
-                    CertUsage::Service => {
-                        debug!("CertUsage::Service");
-                        debug!("selector {:?}", tlsa.selector());
-                        match tlsa.selector() {
-                            Selector::Full => {
-                                debug!("Selector::Full");
+                    CertUsage::Service | CertUsage::DomainIssued => {
+                        debug!("tlsa_matching: {:?}", tlsa.matching());
+                        match tlsa.matching() {
+                            Matching::Sha256 => {
+                                debug!("hash: {:?}", Sha256::digest(&certs[0]));
+                                if Sha256::digest(&certs[0]) == tlsa.cert_data() {
+                                    return true;
+                                }
                             }
-                            Selector::Spki => {
-                                debug!("Selector::Spki");
+                            Matching::Sha512 => {
+                                debug!("hash: {:?}", Sha512::digest(&certs[0]));
+                                /*if Sha512::digest(&certs[0]) == tlsa.cert_data() {
+                                    return true;
+                                }*/
                             }
-                            _ => debug!("Unsupported TLSA::Selector"),
+                            Matching::Raw => {
+                                if certs[0] == tlsa.cert_data() {
+                                    return true;
+                                }
+                            }
+                            _ => debug!("Unsupported TLSA::Matching"),
                         }
                     }
                     CertUsage::TrustAnchor => {
-                        debug!("CertUsage::TrustAnchor");
-                        debug!("selector {:?}", tlsa.selector());
-                        match tlsa.selector() {
-                            Selector::Full => {
-                                debug!("Selector::Full");
+                        debug!("tlsa_matching: {:?}", tlsa.matching());
+/*                        match tlsa.matching() {
+                            Matching::Sha256 => {
+                                if Sha256::digest(&certs[certs.len()-1]) == tlsa.cert_data() {
+                                    return true;
+                                }
                             }
-                            Selector::Spki => {
-                                debug!("Selector::Spki");
+                            Matching::Sha512 => {
+                                if Sha512::digest(&certs[certs.len()-1]) == tlsa.cert_data() {
+                                    return true;
+                                }
                             }
-                            _ => debug!("Unsupported TLSA::Selector"),
-                        }
-                    }
-                    CertUsage::DomainIssued => {
-                        debug!("CertUsage::DomainIssued");
-                        debug!("selector {:?}", tlsa.selector());
-                        match tlsa.selector() {
-                            Selector::Full => {
-                                debug!("Selector::Full");
+                            Matching::Raw => {
+                                if certs[certs.len()-1] == tlsa.cert_data() {
+                                    return true;
+                                }
                             }
-                            Selector::Spki => {
-                                debug!("Selector::Spki");
-                            }
-                            _ => debug!("Unsupported TLSA::Selector"),
-                        }
+                            _ => debug!("Unsupported TLSA::Matching"),
+                        }*/
                     }
                     _ => debug!("Unsupported TLSA::CertUsage"),
                 }
@@ -474,7 +490,6 @@ fn validate_tlsa(tlsa_rrset: &Vec<trust_dns::rr::RData>, _cert_chain: &Vec<Vec<u
             _ => debug!("RRSET contains non-TLSA RR"),
         }
     }
-     */
     return false;
 }
 
