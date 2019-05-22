@@ -29,6 +29,7 @@ use iptables;
 // CONSTANTS
 const DNS_TIMEOUT: u64 = 1000; // Timeout for DNS queries in milliseconds, must be divisible by DNS_TIMEOUT_DECREMENT
 const DNS_TIMEOUT_DECREMENT: u64 = 20; // Decrement for counting down to zero from DNS_TIMEOUT in milliseconds
+const IPT_CHAIN: &str = "danish"; // iptables parent chain
 
 //Types of errors we can generate from parse_cert()
 #[derive(Debug)]
@@ -74,10 +75,20 @@ fn main() {
 
     let mut threads = vec![]; // Our threads
 
-    // Setup our cache
+    // Setup our caches
     let client_cache = Arc::new(RwLock::new(HashMap::<String, ClientCacheEntry>::new()));
     let client_cache_srv = Arc::clone(&client_cache);
     let mut server_cache: HashMap<String, ServerCacheEntry> = HashMap::new();
+
+    // Setup iptables
+    match iptables::new(false) {
+        Err(_) => panic!("FATAL iptables error"),
+        Ok(ipt) => {
+            ipt.new_chain("filter", IPT_CHAIN).expect("FATAL iptables error");
+            ipt.insert_unique("filter", IPT_CHAIN, "-j RETURN", 1).expect("FATAL iptables error");
+            ipt.insert_unique("filter", "FORWARD", &format!("{} {}", "-j", IPT_CHAIN), 1).expect("FATAL iptables error");
+        }
+    }
 
     let client_4_thr = thread::spawn(move || {
         // Setup DNS
@@ -331,6 +342,17 @@ fn main() {
 // Die gracefully
 fn euthanize() {
     info!("Ctrl-C exiting");
+
+    // teardown iptables
+    match iptables::new(false) {
+        Err(_) => panic!("FATAL iptables error"),
+        Ok(ipt) => {
+            ipt.delete("filter", "FORWARD", &format!("{} {}", "-j", IPT_CHAIN)).expect("FATAL iptables error");
+            ipt.flush_chain("filter", IPT_CHAIN).expect("FATAL iptables error");
+            ipt.delete_chain("filter", IPT_CHAIN).expect("FATAL iptables error");
+        }
+    }
+
     std::process::exit(0);
 }
 
@@ -342,7 +364,6 @@ fn read_resolv_conf() -> Result<String, std::io::Error> {
     handle.read_to_string(&mut contents)?;
     return Ok(contents);
 }
-
 
 // Kicks off TLSA validation thread once X.509 cert has been recieved
 // Determines validation disposition and installs ACLs if necessary
