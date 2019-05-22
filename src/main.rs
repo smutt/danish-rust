@@ -1,14 +1,5 @@
 #[macro_use]
 extern crate log;
-extern crate env_logger;
-extern crate ctrlc;
-extern crate pcap;
-extern crate etherparse;
-extern crate tls_parser;
-extern crate nom;
-extern crate trust_dns;
-extern crate resolv_conf;
-extern crate sha2;
 
 use std::str::FromStr;
 use std::{time, thread};
@@ -33,7 +24,7 @@ use trust_dns::rr::RData::TLSA;
 use trust_dns::rr::rdata::tlsa::{CertUsage, Matching, Selector};
 use resolv_conf::{Config, ScopedIp};
 use sha2::{Sha256, Sha512, Digest};
-//use iptables;
+use iptables;
 
 // CONSTANTS
 const DNS_TIMEOUT: u64 = 1000; // Timeout for DNS queries in milliseconds, must be divisible by DNS_TIMEOUT_DECREMENT
@@ -62,6 +53,7 @@ struct ClientCacheEntry { // TODO: Implement staleness
     sni: String, // SNI
     tlsa: Option<Vec<trust_dns::rr::RData>>, // DNS TLSA RRSET
     response: bool, // Have we queried and gotten a response yet?
+    acl: Option<String>, // Reference to ACL installed in iptables
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +142,7 @@ fn main() {
                                                             sni: sni.clone(),
                                                             tlsa: None,
                                                             response: false,
+                                                            acl: None,
                                                         });
 
                                                     // TODO: Perform DNS lookups asynchronously
@@ -164,6 +157,7 @@ fn main() {
                                                             sni: sni.clone(),
                                                             tlsa: None,
                                                             response: true,
+                                                            acl: None,
                                                         });
                                                         debug!("Updated client_cache {:?}", client_cache.read());
                                                     }else{
@@ -175,6 +169,7 @@ fn main() {
                                                                 response.answers().iter().map(|rr| rr.rdata().clone()).collect::<Vec<_>>()
                                                             ),
                                                             response: true,
+                                                            acl: None,
                                                         });
                                                         debug!("Updated client_cache {:?}", client_cache.read());
                                                         for answer in response.answers() {
@@ -367,7 +362,12 @@ fn handle_validation (cl_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>, 
                             debug!("TLSA for {:?} valid", sni);
                         }else{
                             debug!("TLSA for {:?} invalid", sni);
-                            // Install some ACLs
+                            match iptables::new(false) {
+                                Err(err) => panic!("Fatal iptables error {:?}", err),
+                                Ok(_ipt) => {
+                                    debug!("IPTABLES");
+                                }
+                            }
                         }
                         break;
                     }
