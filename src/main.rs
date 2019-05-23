@@ -30,8 +30,8 @@ use iptables;
 const DNS_TIMEOUT: u64 = 1000; // Timeout for DNS queries in milliseconds, must be divisible by DNS_TIMEOUT_DECREMENT
 const DNS_TIMEOUT_DECREMENT: u64 = 20; // Decrement for counting down to zero from DNS_TIMEOUT in milliseconds
 const IPT_CHAIN: &str = "danish"; // iptables parent chain and beginning of each child chain, TODO: make this configurable
-const IPT_DELIM: &str = "_"; // iptables delimeter for child chains (IPT_CHAIN + IPT_DELIM + HASH)
-const IPT_MAX_CHARS: usize = 28; // maxchars for iptables chain names is 28
+const IPT_DELIM: &str = "_"; // iptables delimeter for child chains (IPT_CHAIN + IPT_DELIM + TRUNCATED_HASH)
+const IPT_MAX_CHARS: usize = 28; // maxchars for iptables chain names on Linux
 
 //Types of errors we can generate from parse_cert()
 #[derive(Debug)]
@@ -386,11 +386,11 @@ fn handle_validation(cl_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>, c
         let key = derive_cache_key(&dst, &src, &port);
         let sni = cl_cache.read().get(&key).unwrap().sni.clone();
         let mut ii = DNS_TIMEOUT;
-        while ii > 0 {
+        let chain = loop {
             if cl_cache.read().get(&key).unwrap().response == true {
                 match cl_cache.read().get(&key).unwrap().tlsa {
                     Some(ref tlsa) => {
-                        if validate_tlsa(&tlsa.clone(), &cert_chain) {
+                        if validate_tlsa(tlsa, &cert_chain) {
                             debug!("TLSA for {:?} valid", sni);
                         }else{
                             debug!("TLSA for {:?} invalid", sni);
@@ -424,21 +424,36 @@ fn handle_validation(cl_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>, c
                                     let long_egress =  format!("{}{}{}", "-p tcp --dport 443 -m string --algo bm --string ", &sni, " -j DROP");
                                     debug!("long_egress: {:?}", long_egress);
                                     ipt.insert_unique("filter", &chain, &long_egress, 1).expect("FATAL iptables error");
+
+                                    break Some(chain); // Best line of code evah!
                                 }
                             }
                         }
-                        break;
+                        break None;
                     }
                     _ => {
                         debug!("TLSA for {:?} NXDOMAIN", sni);
-                        break;
+                        break None;
                     }
                 }
             }else{
+                if ii <= 0 {
+                    break None;
+                }
                 thread::sleep(time::Duration::from_millis(DNS_TIMEOUT_DECREMENT));
-                debug!("Slept {:?} ms awaiting DNS response", DNS_TIMEOUT_DECREMENT);
+                debug!("Slept {:?} ms awaiting DNS response for {:?}", DNS_TIMEOUT_DECREMENT, sni);
                 ii = ii - DNS_TIMEOUT_DECREMENT;
             }
+        };
+        match chain {
+            Some(acl) => {
+                debug!("About to update cl_cache");
+                if let Some(entry) = cl_cache.write().get_mut(&key) {
+                    entry.acl = Some(acl.clone());
+                }
+                debug!("Updated cl_cache {:?}", cl_cache.read());
+            },
+            _ => debug!("No ACL installed for {:?}", sni),
         }
     });
 }
@@ -475,7 +490,7 @@ fn validate_tlsa(tlsa_rrset: &Vec<trust_dns::rr::RData>, cert_chain: &Vec<Vec<u8
                         certs = cert_chain.clone(); // TODO: Implement this
                     }
                     _ => {
-                        certs = cert_chain.clone();
+                        certs = cert_chain.clone(); // TODO: Is this really the right thing to do?
                     }
                 }
 
