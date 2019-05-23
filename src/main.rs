@@ -29,7 +29,9 @@ use iptables;
 // CONSTANTS
 const DNS_TIMEOUT: u64 = 1000; // Timeout for DNS queries in milliseconds, must be divisible by DNS_TIMEOUT_DECREMENT
 const DNS_TIMEOUT_DECREMENT: u64 = 20; // Decrement for counting down to zero from DNS_TIMEOUT in milliseconds
-const IPT_CHAIN: &str = "danish"; // iptables parent chain
+const IPT_CHAIN: &str = "danish"; // iptables parent chain and beginning of each child chain, TODO: make this configurable
+const IPT_DELIM: &str = "_"; // iptables delimeter for child chains (IPT_CHAIN + IPT_DELIM + HASH)
+const IPT_MAX_CHARS: usize = 28; // maxchars for iptables chain names is 28
 
 //Types of errors we can generate from parse_cert()
 #[derive(Debug)]
@@ -86,7 +88,7 @@ fn main() {
         Ok(ipt) => {
             ipt.new_chain("filter", IPT_CHAIN).expect("FATAL iptables error");
             ipt.insert_unique("filter", IPT_CHAIN, "-j RETURN", 1).expect("FATAL iptables error");
-            ipt.insert_unique("filter", "FORWARD", &format!("{} {}", "-j", IPT_CHAIN), 1).expect("FATAL iptables error");
+            ipt.insert_unique("filter", "OUTPUT", &format!("{} {}", "-j", IPT_CHAIN), 1).expect("FATAL iptables error");
         }
     }
 
@@ -347,8 +349,17 @@ fn euthanize() {
     match iptables::new(false) {
         Err(_) => panic!("FATAL iptables error"),
         Ok(ipt) => {
-            ipt.delete("filter", "FORWARD", &format!("{} {}", "-j", IPT_CHAIN)).expect("FATAL iptables error");
+            ipt.delete("filter", "OUTPUT", &format!("{} {}", "-j", IPT_CHAIN)).expect("FATAL iptables error");
+            let sub_chains = ipt.list_chains("filter").expect("FATAL iptables error");
             ipt.flush_chain("filter", IPT_CHAIN).expect("FATAL iptables error");
+
+            for chain in sub_chains.iter() {
+                if chain.starts_with(&format!("{}{}", IPT_CHAIN, IPT_DELIM)) {
+                    ipt.flush_chain("filter", chain).expect("FATAL iptables error");
+                    ipt.delete_chain("filter", chain).expect("FATAL iptables error");
+                }
+            }
+
             ipt.delete_chain("filter", IPT_CHAIN).expect("FATAL iptables error");
         }
     }
@@ -367,7 +378,7 @@ fn read_resolv_conf() -> Result<String, std::io::Error> {
 
 // Kicks off TLSA validation thread once X.509 cert has been recieved
 // Determines validation disposition and installs ACLs if necessary
-fn handle_validation (cl_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>, cert_chain: Vec<Vec<u8>>,
+fn handle_validation(cl_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>, cert_chain: Vec<Vec<u8>>,
                       src: [u8;4], dst: [u8;4], port: u16) {
     debug!("Entered handle_validation {:?} {:?} {:?}", src, dst, port);
 
@@ -385,8 +396,34 @@ fn handle_validation (cl_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>, 
                             debug!("TLSA for {:?} invalid", sni);
                             match iptables::new(false) {
                                 Err(err) => panic!("Fatal iptables error {:?}", err),
-                                Ok(_ipt) => {
-                                    debug!("IPTABLES");
+                                Ok(ipt) => {
+                                    let chain = gen_chain_name(&sni);
+                                    for existing in ipt.list_chains("filter").expect("FATAL iptables error").iter() {
+                                        if &chain == existing {
+                                            panic!("iptables chain already exists {:?} {:?}", sni, chain);
+                                        }
+                                    }
+                                    debug!("Creating then inserting into {:?}", chain);
+                                    ipt.new_chain("filter", &chain).expect("FATAL iptables error");
+                                    ipt.insert_unique("filter", &chain, "-j RETURN", 1).expect("FATAL iptables error");
+                                    ipt.insert_unique("filter", IPT_CHAIN, &format!("{} {}", "-j", &chain), 1).expect("FATAL iptables error");
+                                    debug!("ip_src: {:?}", ipv4_display(&src));
+
+                                    let short_ingress = format!("{}{}{}{}{}{}{}{}{}", "--destination ", ipv4_display(&dst), "/32 ",
+                                                               "--source ", ipv4_display(&src), "/32 ",
+                                                               "-p tcp --sport 443 --dport ", format!("{}", port), " -j DROP");
+                                    debug!("short_ingress: {:?}", short_ingress);
+                                    ipt.insert_unique("filter", &chain, &short_ingress, 1).expect("FATAL iptables error");
+
+                                    let short_egress = format!("{}{}{}{}{}{}{}{}{}", "--destination ", ipv4_display(&src), "/32 ",
+                                                               "--source ", ipv4_display(&dst), "/32 ",
+                                                               "-p tcp --dport 443 --sport ", format!("{}", port), " -j DROP");
+                                    debug!("short_egress: {:?}", short_egress);
+                                    ipt.insert_unique("filter", &chain, &short_egress, 1).expect("FATAL iptables error");
+
+                                    let long_egress =  format!("{}{}{}", "-p tcp --dport 443 -m string --algo bm --string ", &sni, " -j DROP");
+                                    debug!("long_egress: {:?}", long_egress);
+                                    ipt.insert_unique("filter", &chain, &long_egress, 1).expect("FATAL iptables error");
                                 }
                             }
                         }
@@ -406,6 +443,19 @@ fn handle_validation (cl_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>, 
     });
 }
 
+// Returns display formatted string for ipv4 address
+fn ipv4_display(ip: &[u8;4]) -> String {
+    return ip.iter().map(|x| format!(".{}", x)).collect::<String>().split_off(1);
+}
+
+// Generates an iptables chain name from passed SNI
+// There is a very small chance of collision here which we're ignoring for now
+fn gen_chain_name(sni: &str) -> String {
+    let id_len: usize = (IPT_MAX_CHARS - IPT_CHAIN.len() - IPT_DELIM.len()) / 2;
+    let hash = Sha256::digest(&sni.as_bytes()).to_vec()[0..id_len].to_vec();
+    return format!("{}{}{}", IPT_CHAIN, IPT_DELIM,
+                   hash.iter().map(|x| format!("{:x}", x)).collect::<String>());
+}
 
 // Validates X.509 cert against TLSA 
 // Takes RData of DNS TLSA RRSET and DER encoded X.509 cert chain
