@@ -169,7 +169,7 @@ fn main() {
                                                         let qname = "_443._tcp.".to_owned() + &sni.clone();
                                                         let name = Name::from_str(&qname).unwrap();
                                                         let response: DnsResponse = client.query(&name, DNSClass::IN, RecordType::TLSA).unwrap();
-                                                        debug!("DNS Response for {:?}", qname);
+                                                        debug!("DNS response for {:?}", qname);
                                                         if response.answers().len() == 0 { // TODO: Get smarter about recognizing NXDOMAIN
                                                             debug!("{:?} TLSA returned NXDOMAIN", qname);
                                                             if let Some(entry) = client_cache_dns.write().get_mut(&key) {
@@ -453,7 +453,7 @@ fn handle_validation(cl_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>, c
                     break None;
                 }
                 thread::sleep(time::Duration::from_millis(DNS_TIMEOUT_DECREMENT));
-                debug!("Slept {:?} ms awaiting DNS response for {:?}", DNS_TIMEOUT_DECREMENT, sni);
+                debug!("{:?} Slept {:?} ms awaiting DNS response for {:?}", ii, DNS_TIMEOUT_DECREMENT, sni);
                 ii = ii - DNS_TIMEOUT_DECREMENT;
             }
         };
