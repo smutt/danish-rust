@@ -34,16 +34,18 @@ const DNS_TIMEOUT_DECREMENT: u64 = 20; // Decrement for counting down to zero fr
 const IPT_CHAIN: &str = "danish"; // iptables parent chain and beginning of each child chain, TODO: make this configurable
 const IPT_DELIM: &str = "_"; // iptables delimeter for child chains (IPT_CHAIN + IPT_DELIM + TRUNCATED_HASH)
 const IPT_MAX_CHARS: usize = 28; // maxchars for iptables chain names on Linux
-const CACHE_MIN_STALENESS: u64 = 10; // minimum seconds for a stale cache entry to live before deletion
+const CACHE_MIN_STALENESS: u64 = 10; // minimum seconds for a stale [client || server] cache entry to live before deletion
+const ACL_SHORT_TIMEOUT: u64 = 60; // How many seconds do our short ACLs remain installed?
+const ACL_LONG_TIMEOUT: u64 = 600; // How many seconds do our long ACLs remain installed?
 
-//Types of errors we can generate from parse_cert()
+// Types of errors we can generate from parse_cert()
 #[derive(Debug)]
 enum CertParseError {
     IncompleteTlsRecord,
     WrongTlsRecord,
 }
 
-//Types of errors we can generate from parse_sni()
+// Types of errors we can generate from parse_sni()
 #[derive(Debug)]
 enum SniParseError {
     TlsExtensionError,
@@ -74,8 +76,10 @@ struct ServerCacheEntry {
 #[derive(Debug, Clone)]
 struct AclCacheEntry { // Key in hashmap is iptables chain name
     ts: SystemTime, // Last touched timestamp
-    insert_ts: SystemTime, // When was this ACL inserted?
+    insert_ts: SystemTime, // When were these ACLs inserted? None if not yet inserted.
     sni: String, // SNI
+    short_active: bool, // Is the short term ACL active?
+    long_active: bool, // Is the long term ACL active?
     stale: bool, // Entry can be deleted at next cleanup
 }
 
@@ -95,6 +99,7 @@ fn main() {
     let client_cache_srv = Arc::clone(&client_cache);
     let mut server_cache: HashMap<String, ServerCacheEntry> = HashMap::new();
     let acl_cache = Arc::new(RwLock::new(HashMap::<String, AclCacheEntry>::new()));
+//    let acl_cache_clean = Arc::clone(&acl_cache);
 
     // Setup iptables
     match iptables::new(false) {
@@ -444,7 +449,7 @@ fn handle_validation(acl_cache: Arc<RwLock<HashMap<String, AclCacheEntry>>>,
         let key = derive_cache_key(&dst, &src, &port);
         let sni = cl_cache.read().get(&key).unwrap().sni.clone();
         let mut ii = DNS_TIMEOUT;
-        let chain = loop {
+        loop {
             if cl_cache.read().get(&key).unwrap().response == true {
                 match cl_cache.read().get(&key).unwrap().tlsa {
                     Some(ref tlsa) => {
@@ -470,42 +475,39 @@ fn handle_validation(acl_cache: Arc<RwLock<HashMap<String, AclCacheEntry>>>,
                                         break attempt;
                                     };
 
-                                    debug!("Creating then inserting into {:?}", chain);
-                                    ipt.new_chain("filter", &chain).expect("FATAL iptables error");
-                                    ipt.insert_unique("filter", &chain, "-j RETURN", 1).expect("FATAL iptables error");
-                                    ipt.insert_unique("filter", IPT_CHAIN, &format!("{} {}", "-j", &chain), 1).expect("FATAL iptables error");
-                                    debug!("ip_src: {:?}", ipv4_display(&src));
+                                    match ipt_add_chain(&ipt, &chain) { // Create iptables chains and insert rules
+                                        Err(err) => panic!("Fatal iptables error at add_chain {:?}", err),
+                                        Ok(_) => {
+                                            match ipt_add_v4_short(&ipt, &chain, ipv4_display(&src), ipv4_display(&dst), port) {
+                                                Err(err) => panic!("Fatal iptables error at add_short {:?}", err),
+                                                Ok(_) => ipt_add_v4_long(&ipt, &chain, &sni).expect("Fatal iptables error at add_long"),
+                                            }
+                                        }
+                                    }
 
-                                    let short_ingress = format!("{}{}{}{}{}{}{}{}{}", "--destination ", ipv4_display(&dst), "/32 ",
-                                                               "--source ", ipv4_display(&src), "/32 ",
-                                                               "-p tcp --sport 443 --dport ", format!("{}", port), " -j DROP");
-                                    debug!("short_ingress: {:?}", short_ingress);
-                                    ipt.insert_unique("filter", &chain, &short_ingress, 1).expect("FATAL iptables error");
-
-                                    let short_egress = format!("{}{}{}{}{}{}{}{}{}", "--destination ", ipv4_display(&src), "/32 ",
-                                                               "--source ", ipv4_display(&dst), "/32 ",
-                                                               "-p tcp --dport 443 --sport ", format!("{}", port), " -j DROP");
-                                    debug!("short_egress: {:?}", short_egress);
-                                    ipt.insert_unique("filter", &chain, &short_egress, 1).expect("FATAL iptables error");
-
-                                    let long_egress =  format!("{}{}{}", "-p tcp --dport 443 -m string --algo bm --string ", &sni, " -j DROP");
-                                    debug!("long_egress: {:?}", long_egress);
-                                    ipt.insert_unique("filter", &chain, &long_egress, 1).expect("FATAL iptables error");
-
-                                    break Some(chain); // Best line of code evah!
+                                    debug!("Inserting new acl_cache entry {:?}", chain);
+                                    acl_cache.write().insert(chain, AclCacheEntry {
+                                        ts: SystemTime::now(),
+                                        insert_ts: SystemTime::now(),
+                                        sni: sni.clone(),
+                                        short_active: true,
+                                        long_active: true,
+                                        stale: false,
+                                    });
+                                    break;
                                 }
                             }
                         }
-                        break None;
+                        break;
                     }
                     _ => {
                         debug!("TLSA for {:?} NXDOMAIN", sni);
-                        break None;
+                        break;
                     }
                 }
             }else{
                 if ii <= 0 {
-                    break None;
+                    break;
                 }
                 thread::sleep(time::Duration::from_millis(DNS_TIMEOUT_DECREMENT));
                 debug!("{:?} Slept {:?} ms awaiting DNS response for {:?}", ii, DNS_TIMEOUT_DECREMENT, sni);
@@ -513,26 +515,47 @@ fn handle_validation(acl_cache: Arc<RwLock<HashMap<String, AclCacheEntry>>>,
             }
         };
 
+        // Mark client_cache entry as stale
         if let Some(entry) = cl_cache.write().get_mut(&key) {
             entry.stale = true;
             entry.ts = SystemTime::now();
         }else{
             panic!("Failed to update cl_cache");
         }
-
-        match chain {
-            Some(acl) => {
-                debug!("Inserting new acl_cache entry {:?}", acl);
-                acl_cache.write().insert(acl, AclCacheEntry {
-                    ts: SystemTime::now(),
-                    insert_ts: SystemTime::now(),
-                    sni: sni.clone(),
-                    stale: false,
-                });
-            },
-            _ => debug!("No ACL installed for {:?}", sni),
-        }
     });
+}
+
+// Adds a new iptables chain and links it to main Danish chain
+fn ipt_add_chain(ipt: &iptables::IPTables, chain: &String) ->  Result<(), iptables::error::IPTError> {
+    debug!("Creating then inserting into {:?}", chain);
+    ipt.new_chain("filter", &chain)?;
+    ipt.insert_unique("filter", &chain, "-j RETURN", 1)?;
+    ipt.insert_unique("filter", IPT_CHAIN, &format!("{} {}", "-j", &chain), 1)?;
+    return Ok(());
+}
+
+// Adds short term ingress and egress ACLs to a chain
+fn ipt_add_v4_short(ipt: &iptables::IPTables, chain: &String, src: String, dst: String, port: u16) -> Result<(), iptables::error::IPTError> {
+    let short_ingress = format!("{}{}{}{}{}{}{}{}{}", "--destination ", &dst, "/32 ",
+                                "--source ", &src, "/32 ",
+                                "-p tcp --sport 443 --dport ", format!("{}", port), " -j DROP");
+    ipt.insert_unique("filter", &chain, &short_ingress, 1)?;
+    debug!("Inserted short_ingress: {:?}", short_ingress);
+
+    let short_egress = format!("{}{}{}{}{}{}{}{}{}", "--destination ", &src, "/32 ",
+                               "--source ", &dst, "/32 ",
+                               "-p tcp --dport 443 --sport ", format!("{}", port), " -j DROP");
+    ipt.insert_unique("filter", &chain, &short_egress, 1)?;
+    debug!("Inserted short_egress: {:?}", short_egress);
+    return Ok(());
+}
+
+// Add long term egress ACL to a chain
+fn ipt_add_v4_long(ipt: &iptables::IPTables, chain: &String, sni: &String) -> Result<(), iptables::error::IPTError> {
+    let long_egress =  format!("{}{}{}", "-p tcp --dport 443 -m string --algo bm --string ", &sni, " -j DROP");
+    debug!("long_egress: {:?}", long_egress);
+    ipt.insert_unique("filter", &chain, &long_egress, 1)?;
+    return Ok(());
 }
 
 // Returns display formatted string for ipv4 address
