@@ -542,14 +542,13 @@ fn validate_tlsa(tlsa_rrset: &Vec<trust_dns::rr::RData>, cert_chain: &Vec<Vec<u8
         match rr{
             TLSA(tlsa) => {
                 match tlsa.selector() {
-                    Selector::Full => {
-                        certs = cert_chain.clone();
-                    }
-                    Selector::Spki => {
+                    Selector::Full => certs = cert_chain.clone(), // 0
+                    Selector::Spki => { // 1
                         certs = cert_chain.clone(); // TODO: Implement this
                     }
                     _ => {
-                        certs = cert_chain.clone(); // TODO: Is this really the right thing to do?
+                        certs = cert_chain.clone();
+                        debug!("Invalid TLSA selector, assuming Full");
                     }
                 }
 
