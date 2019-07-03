@@ -475,25 +475,31 @@ fn handle_validation(acl_cache: Arc<RwLock<HashMap<String, AclCacheEntry>>>,
                                         break attempt;
                                     };
 
-                                    match ipt_add_chain(&ipt, &chain) { // Create iptables chains and insert rules
+                                    // Create iptables chains, insert ACLs and create acl_cache entry
+                                    match ipt_add_chain(&ipt, &chain) { 
                                         Err(err) => panic!("Fatal iptables error at add_chain {:?}", err),
                                         Ok(_) => {
                                             match ipt_add_v4_short(&ipt, &chain, ipv4_display(&src), ipv4_display(&dst), port) {
                                                 Err(err) => panic!("Fatal iptables error at add_short {:?}", err),
-                                                Ok(_) => ipt_add_v4_long(&ipt, &chain, &sni).expect("Fatal iptables error at add_long"),
+                                                Ok(_) => {
+                                                    match ipt_add_v4_long(&ipt, &chain, &sni) {
+                                                        Err(err) => panic!("Fatal iptables error at add_long {:?}", err),
+                                                        Ok(_) => {
+                                                            debug!("Inserting new acl_cache entry {:?}", chain);
+                                                            acl_cache.write().insert(chain, AclCacheEntry {
+                                                                ts: SystemTime::now(),
+                                                                insert_ts: SystemTime::now(),
+                                                                sni: sni.clone(),
+                                                                short_active: true,
+                                                                long_active: true,
+                                                                stale: false,
+                                                            });
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                     }
-
-                                    debug!("Inserting new acl_cache entry {:?}", chain);
-                                    acl_cache.write().insert(chain, AclCacheEntry {
-                                        ts: SystemTime::now(),
-                                        insert_ts: SystemTime::now(),
-                                        sni: sni.clone(),
-                                        short_active: true,
-                                        long_active: true,
-                                        stale: false,
-                                    });
                                     break;
                                 }
                             }
