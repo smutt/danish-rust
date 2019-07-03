@@ -139,6 +139,22 @@ fn main() {
                         }
 
                         while let Ok(packet) = client_cap.next() {
+                            // Clean up old client cache entries
+                            debug!("Investigating client_cache staleness {:?}", client_cache.read().len());
+                            let mut stale = Vec::new();
+                            for (key,entry) in client_cache.read().iter() {
+                                if entry.stale {
+                                    if entry.ts < SystemTime::now() - Duration::new(CACHE_MIN_STALENESS, 0) {
+                                        stale.push(key.clone());
+                                        debug!("Added stale client_cache entry {:?}", key);
+                                    }
+                                }
+                            }
+                            for key in stale.iter() {
+                                client_cache.write().remove(key);
+                                debug!("Deleted stale client_cache entry {:?}", key);
+                            }
+                            drop(stale);
                             let pkt = PacketHeaders::from_ethernet_slice(&packet).expect("Failed to decode packet");
                             //debug!("Everything: {:?}", pkt);
 
@@ -208,21 +224,6 @@ fn main() {
                                         }
                                     }
                                 }
-                            }
-                            // Clean up old client cache entries
-                            debug!("Investigating client_cache staleness {:?}", client_cache.read().len());
-                            let mut stale = Vec::new();
-                            for (key,entry) in client_cache.read().iter() {
-                                if entry.stale {
-                                    if entry.ts < SystemTime::now() - Duration::new(CACHE_MIN_STALENESS, 0) {
-                                        stale.push(key.clone());
-                                        debug!("Added stale client_cache entry {:?}", key);
-                                    }
-                                }
-                            }
-                            for key in stale.iter() {
-                                client_cache.write().remove(key);
-                                debug!("Deleted stale client_cache entry {:?}", key);
                             }
                         }
                     }
