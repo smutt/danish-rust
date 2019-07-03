@@ -17,4 +17,4 @@ trust-dns =  { version = "^0.14" }
 resolv-conf = "0.6.2"
 parking_lot = "0.8.0"
 sha2 = "0.8.0"
-
+rand = "0.7"

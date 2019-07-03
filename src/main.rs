@@ -2,7 +2,7 @@
 extern crate log;
 
 use std::str::FromStr;
-use std::{time, thread};
+use std::{iter, time, thread};
 use std::time::{Duration, SystemTime};
 use std::io::prelude::*;
 use std::fs::File;
@@ -22,6 +22,8 @@ use trust_dns::op::DnsResponse;
 use trust_dns::rr::{DNSClass, Name, RecordType};
 use trust_dns::rr::RData::TLSA;
 use trust_dns::rr::rdata::tlsa::{CertUsage, Matching, Selector};
+use rand::{Rng, thread_rng};
+use rand::distributions::Alphanumeric;
 use resolv_conf::{Config, ScopedIp};
 use sha2::{Sha256, Sha512, Digest};
 use iptables;
@@ -57,7 +59,6 @@ struct ClientCacheEntry {
     sni: String, // SNI
     tlsa: Option<Vec<trust_dns::rr::RData>>, // DNS TLSA RRSET
     response: bool, // Have we queried and gotten a response yet?
-    acl: Option<String>, // Reference to ACL installed in iptables TODO: Move this to AclCache
     stale: bool, // Entry can be deleted at next cleanup
 }
 
@@ -70,14 +71,13 @@ struct ServerCacheEntry {
     stale: bool, // Entry can be deleted at next cleanup
 }
 
-/* Need to break out ACL caches into their own separate entries and Hashmap
 #[derive(Debug, Clone)]
-struct AclCacheEntry { 
+struct AclCacheEntry { // Key in hashmap is iptables chain name
     ts: SystemTime, // Last touched timestamp
-    acl: String,
+    insert_ts: SystemTime, // When was this ACL inserted?
+    sni: String, // SNI
     stale: bool, // Entry can be deleted at next cleanup
 }
-*/
 
 fn main() {
     env_logger::builder().default_format_timestamp(false).init();
@@ -94,6 +94,7 @@ fn main() {
     let client_cache = Arc::new(RwLock::new(HashMap::<String, ClientCacheEntry>::new()));
     let client_cache_srv = Arc::clone(&client_cache);
     let mut server_cache: HashMap<String, ServerCacheEntry> = HashMap::new();
+    let acl_cache = Arc::new(RwLock::new(HashMap::<String, AclCacheEntry>::new()));
 
     // Setup iptables
     match iptables::new(false) {
@@ -166,7 +167,6 @@ fn main() {
                                                             sni: sni.clone(),
                                                             tlsa: None,
                                                             response: false,
-                                                            acl: None,
                                                             stale: false,
                                                         });
 
@@ -296,8 +296,8 @@ fn main() {
                                                 debug!("TLS cert found, len: {:?}", cert_chain.len());
 
                                                 debug!("Handling validation cert_len: {:?}", cert_chain.len());
-                                                handle_validation(Arc::clone(&client_cache_srv), cert_chain.clone(),
-                                                                  resp_ip_src, resp_ip_dst, tcp.destination_port);
+                                                handle_validation(Arc::clone(&acl_cache), Arc::clone(&client_cache_srv),
+                                                                  cert_chain.clone(), resp_ip_src, resp_ip_dst, tcp.destination_port);
 
                                                 debug!("Finalizing server_cache entry: {:?}", key);
                                                 server_cache.insert(key.clone(), ServerCacheEntry {
@@ -335,8 +335,8 @@ fn main() {
                                                 debug!("cert_len: {:?}", cert_chain.len());
 
                                                 debug!("Handling validation cert_len: {:?}", cert_chain.len());
-                                                handle_validation(Arc::clone(&client_cache_srv), cert_chain.clone(),
-                                                                  resp_ip_src, resp_ip_dst, tcp.destination_port);
+                                                handle_validation(Arc::clone(&acl_cache), Arc::clone(&client_cache_srv),
+                                                                  cert_chain.clone(), resp_ip_src, resp_ip_dst, tcp.destination_port);
 
                                                 debug!("Finalizing server_cache entry: {:?}", key);
                                                 server_cache.insert(key.clone(), ServerCacheEntry {
@@ -417,8 +417,10 @@ fn read_resolv_conf() -> Result<String, std::io::Error> {
 
 // Kicks off TLSA validation thread once X.509 cert has been received
 // Determines validation disposition and installs ACLs if necessary
-fn handle_validation(cl_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>, cert_chain: Vec<Vec<u8>>,
-                      src: [u8;4], dst: [u8;4], port: u16) {
+fn handle_validation(acl_cache: Arc<RwLock<HashMap<String, AclCacheEntry>>>,
+                     cl_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>,
+                     cert_chain: Vec<Vec<u8>>, src: [u8;4], dst: [u8;4], port: u16) {
+
     debug!("Entered handle_validation {:?} {:?} {:?}", src, dst, port);
 
     thread::spawn(move || {
@@ -436,12 +438,21 @@ fn handle_validation(cl_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>, c
                             match iptables::new(false) {
                                 Err(err) => panic!("Fatal iptables error {:?}", err),
                                 Ok(ipt) => {
-                                    let chain = gen_chain_name(&sni);
-                                    for existing in ipt.list_chains("filter").expect("FATAL iptables error").iter() {
-                                        if &chain == existing {
-                                            panic!("iptables chain already exists {:?} {:?}", sni, chain);
+                                    let chain = loop { // Ensure our chain name is unique
+                                        let mut strn = sni.clone();
+                                        let attempt = gen_chain_name(&strn);
+                                        for existing in ipt.list_chains("filter").expect("FATAL iptables error").iter() {
+                                            if &attempt == existing {
+                                                debug!("iptables chain already exists {:?} {:?}", sni, attempt);
+                                                let mut rng = thread_rng(); // Generate random strn
+                                                strn = iter::repeat(())
+                                                    .map(|()| rng.sample(Alphanumeric)).take(strn.len()).collect();
+                                                continue;
+                                            }
                                         }
-                                    }
+                                        break attempt;
+                                    };
+
                                     debug!("Creating then inserting into {:?}", chain);
                                     ipt.new_chain("filter", &chain).expect("FATAL iptables error");
                                     ipt.insert_unique("filter", &chain, "-j RETURN", 1).expect("FATAL iptables error");
@@ -484,27 +495,25 @@ fn handle_validation(cl_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>, c
                 ii = ii - DNS_TIMEOUT_DECREMENT;
             }
         };
+
+        if let Some(entry) = cl_cache.write().get_mut(&key) {
+            entry.stale = true;
+            entry.ts = SystemTime::now();
+        }else{
+            panic!("Failed to update cl_cache");
+        }
+
         match chain {
             Some(acl) => {
-                debug!("About to update cl_cache");
-                if let Some(entry) = cl_cache.write().get_mut(&key) {
-                    entry.acl = Some(acl.clone());
-                    entry.stale = true;
-                    entry.ts = SystemTime::now();
-                }else{
-                    panic!("Failed to update cl_cache");
-                }
-                debug!("Updated cl_cache {:?}", cl_cache.read());
+                debug!("Inserting new acl_cache entry {:?}", acl);
+                acl_cache.write().insert(acl, AclCacheEntry {
+                    ts: SystemTime::now(),
+                    insert_ts: SystemTime::now(),
+                    sni: sni.clone(),
+                    stale: false,
+                });
             },
-            _ => {
-                if let Some(entry) = cl_cache.write().get_mut(&key) {
-                    entry.stale = true;
-                    entry.ts = SystemTime::now();
-                }else{
-                    panic!("Failed to update cl_cache");
-                }
-                debug!("No ACL installed for {:?}", sni);
-            }
+            _ => debug!("No ACL installed for {:?}", sni),
         }
     });
 }
@@ -515,7 +524,6 @@ fn ipv4_display(ip: &[u8;4]) -> String {
 }
 
 // Generates an iptables chain name from passed SNI
-// There is a very small chance of collision here which we're ignoring for now
 fn gen_chain_name(sni: &str) -> String {
     let id_len: usize = (IPT_MAX_CHARS - IPT_CHAIN.len() - IPT_DELIM.len()) / 2;
     let hash = Sha256::digest(&sni.as_bytes()).to_vec()[0..id_len].to_vec();
