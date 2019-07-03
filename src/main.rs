@@ -415,7 +415,7 @@ fn euthanize() {
             ipt.flush_chain("filter", IPT_CHAIN).expect("FATAL iptables error");
 
             for chain in sub_chains.iter() {
-                if chain.starts_with(&format!("{}{}", IPT_CHAIN, IPT_DELIM)) {
+                if chain.starts_with(&format!("{}{}", IPT_CHAIN, IPT_DELIM)) { // TODO: Use AclCache to do this better
                     ipt.flush_chain("filter", chain).expect("FATAL iptables error");
                     ipt.delete_chain("filter", chain).expect("FATAL iptables error");
                 }
@@ -532,11 +532,40 @@ fn handle_validation(acl_cache: Arc<RwLock<HashMap<String, AclCacheEntry>>>,
 }
 
 // Adds a new iptables chain and links it to main Danish chain
-fn ipt_add_chain(ipt: &iptables::IPTables, chain: &String) ->  Result<(), iptables::error::IPTError> {
+fn ipt_add_chain(ipt: &iptables::IPTables, chain: &String) -> Result<(), iptables::error::IPTError> {
     debug!("Creating then inserting into {:?}", chain);
     ipt.new_chain("filter", &chain)?;
     ipt.insert_unique("filter", &chain, "-j RETURN", 1)?;
     ipt.insert_unique("filter", IPT_CHAIN, &format!("{} {}", "-j", &chain), 1)?;
+    return Ok(());
+}
+
+// Delinks then deletes an existing iptables chain
+fn ipt_del_chain(ipt: &iptables::IPTables, chain: &String) -> Result<(), iptables::error::IPTError> {
+    debug!("Deleting chain {:?}", chain);
+    ipt.delete("filter", IPT_CHAIN, &format!("{} {}", "-j", &chain))?;
+    ipt.flush_chain("filter", &chain)?;
+    ipt.delete_chain("filter", &chain)?;
+    return Ok(());
+}
+
+// Deletes short term ingress and egress ACLs in a chain
+fn ipt_del_short(ipt: &iptables::IPTables, chain: &String) -> Result<(), iptables::error::IPTError> {
+    for acl in ipt.list("filter", &chain)?.iter() {
+        if acl.contains("--destination") {
+            ipt.delete("filter", &chain, &acl)?;
+        }
+    }
+    return Ok(());
+}
+
+// Deletes long term ACL in a chain
+fn ipt_del_long(ipt: &iptables::IPTables, chain: &String) -> Result<(), iptables::error::IPTError> {
+    for acl in ipt.list("filter", &chain)?.iter() {
+        if acl.contains("--string") {
+            ipt.delete("filter", &chain, &acl)?;
+        }
+    }
     return Ok(());
 }
 
