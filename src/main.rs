@@ -3,7 +3,7 @@ extern crate log;
 
 use std::str::FromStr;
 use std::{time, thread};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use std::io::prelude::*;
 use std::fs::File;
 use std::path::Path;
@@ -32,6 +32,7 @@ const DNS_TIMEOUT_DECREMENT: u64 = 20; // Decrement for counting down to zero fr
 const IPT_CHAIN: &str = "danish"; // iptables parent chain and beginning of each child chain, TODO: make this configurable
 const IPT_DELIM: &str = "_"; // iptables delimeter for child chains (IPT_CHAIN + IPT_DELIM + TRUNCATED_HASH)
 const IPT_MAX_CHARS: usize = 28; // maxchars for iptables chain names on Linux
+const CACHE_MIN_STALENESS: u64 = 10; // minimum seconds for a stale cache entry to live before deletion
 
 //Types of errors we can generate from parse_cert()
 #[derive(Debug)]
@@ -56,7 +57,7 @@ struct ClientCacheEntry {
     sni: String, // SNI
     tlsa: Option<Vec<trust_dns::rr::RData>>, // DNS TLSA RRSET
     response: bool, // Have we queried and gotten a response yet?
-    acl: Option<String>, // Reference to ACL installed in iptables
+    acl: Option<String>, // Reference to ACL installed in iptables TODO: Move this to AclCache
     stale: bool, // Entry can be deleted at next cleanup
 }
 
@@ -69,6 +70,15 @@ struct ServerCacheEntry {
     stale: bool, // Entry can be deleted at next cleanup
 }
 
+/* Need to break out ACL caches into their own separate entries and Hashmap
+#[derive(Debug, Clone)]
+struct AclCacheEntry { 
+    ts: SystemTime, // Last touched timestamp
+    acl: String,
+    stale: bool, // Entry can be deleted at next cleanup
+}
+*/
+
 fn main() {
     env_logger::builder().default_format_timestamp(false).init();
     debug!("Start");
@@ -80,6 +90,7 @@ fn main() {
     let mut threads = vec![]; // Our threads
 
     // Setup our caches
+    // TODO: We may get better cache entry atomicity if we use crate chashmap, need to investigate
     let client_cache = Arc::new(RwLock::new(HashMap::<String, ClientCacheEntry>::new()));
     let client_cache_srv = Arc::clone(&client_cache);
     let mut server_cache: HashMap<String, ServerCacheEntry> = HashMap::new();
@@ -174,6 +185,7 @@ fn main() {
                                                             debug!("{:?} TLSA returned NXDOMAIN", qname);
                                                             if let Some(entry) = client_cache_dns.write().get_mut(&key) {
                                                                 entry.response = true;
+                                                                entry.stale = true;
                                                                 entry.ts = SystemTime::now();
                                                             }else{
                                                                 panic!("Failed to update client_cache_dns");
@@ -196,6 +208,21 @@ fn main() {
                                         }
                                     }
                                 }
+                            }
+                            // Clean up old client cache entries
+                            debug!("Investigating client_cache staleness {:?}", client_cache.read().len());
+                            let mut stale = Vec::new();
+                            for (key,entry) in client_cache.read().iter() {
+                                if entry.stale {
+                                    if entry.ts < SystemTime::now() - Duration::new(CACHE_MIN_STALENESS, 0) {
+                                        stale.push(key.clone());
+                                        debug!("Added stale client_cache entry {:?}", key);
+                                    }
+                                }
+                            }
+                            for key in stale.iter() {
+                                client_cache.write().remove(key);
+                                debug!("Deleted stale client_cache entry {:?}", key);
                             }
                         }
                     }
@@ -469,7 +496,15 @@ fn handle_validation(cl_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>, c
                 }
                 debug!("Updated cl_cache {:?}", cl_cache.read());
             },
-            _ => debug!("No ACL installed for {:?}", sni),
+            _ => {
+                if let Some(entry) = cl_cache.write().get_mut(&key) {
+                    entry.stale = true;
+                    entry.ts = SystemTime::now();
+                }else{
+                    panic!("Failed to update cl_cache");
+                }
+                debug!("No ACL installed for {:?}", sni);
+            }
         }
     });
 }
