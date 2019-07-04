@@ -114,22 +114,22 @@ fn main() {
     let acl_cache_thr = thread::spawn(move || {
         thread::sleep(time::Duration::new(ACL_CACHE_DELAY, 0));
         debug!("Investigating acl_cache staleness {:?}", acl_cache_clean.read().len());
+        let mut short_stale = Vec::new();
+        let mut long_stale = Vec::new();
+        for (key,entry) in acl_cache_clean.read().iter() {
+            if entry.short_active {
+                if SystemTime::now() > entry.insert_ts + Duration::new(ACL_SHORT_TIMEOUT, 0) {
+                    short_stale.push(key.clone());
+                }
+            }
+            if SystemTime::now() > entry.insert_ts + Duration::new(ACL_LONG_TIMEOUT, 0) {
+                long_stale.push(key.clone());
+            }
+        }
+
         match iptables::new(false) {
             Err(_) => panic!("FATAL iptables error"),
             Ok(ipt) => {
-                let mut short_stale = Vec::new();
-                let mut long_stale = Vec::new();
-                for (key,entry) in acl_cache_clean.read().iter() {
-                    if entry.short_active {
-                        if SystemTime::now() > entry.insert_ts + Duration::new(ACL_SHORT_TIMEOUT, 0) {
-                            short_stale.push(key.clone());
-                        }
-                    }
-                    if SystemTime::now() > entry.insert_ts + Duration::new(ACL_LONG_TIMEOUT, 0) {
-                        long_stale.push(key.clone());
-                    }
-                }
-
                 for key in short_stale.iter() {
                     ipt_del_short(&ipt, &key).expect("FATAL iptables error");
                     if let Some(entry) = acl_cache_clean.write().get_mut(key) {
