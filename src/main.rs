@@ -35,6 +35,7 @@ const IPT_CHAIN: &str = "danish"; // iptables parent chain and beginning of each
 const IPT_DELIM: &str = "_"; // iptables delimeter for child chains (IPT_CHAIN + IPT_DELIM + TRUNCATED_HASH)
 const IPT_MAX_CHARS: usize = 28; // maxchars for iptables chain names on Linux
 const CACHE_MIN_STALENESS: u64 = 10; // minimum seconds for a stale [client || server] cache entry to live before deletion
+const ACL_CACHE_DELAY: u64 = 10; // Sleep this many seconds between acl_cache cleanup cycles
 const ACL_SHORT_TIMEOUT: u64 = 60; // How many seconds do our short ACLs remain installed?
 const ACL_LONG_TIMEOUT: u64 = 600; // How many seconds do our long ACLs remain installed?
 
@@ -79,8 +80,6 @@ struct AclCacheEntry { // Key in hashmap is iptables chain name
     insert_ts: SystemTime, // When were these ACLs inserted? None if not yet inserted.
     sni: String, // SNI
     short_active: bool, // Is the short term ACL active?
-    long_active: bool, // Is the long term ACL active?
-    stale: bool, // Entry can be deleted at next cleanup
 }
 
 fn main() {
@@ -99,7 +98,7 @@ fn main() {
     let client_cache_srv = Arc::clone(&client_cache);
     let mut server_cache: HashMap<String, ServerCacheEntry> = HashMap::new();
     let acl_cache = Arc::new(RwLock::new(HashMap::<String, AclCacheEntry>::new()));
-//    let acl_cache_clean = Arc::clone(&acl_cache);
+    let acl_cache_clean = Arc::clone(&acl_cache);
 
     // Setup iptables
     match iptables::new(false) {
@@ -110,6 +109,46 @@ fn main() {
             ipt.insert_unique("filter", "OUTPUT", &format!("{} {}", "-j", IPT_CHAIN), 1).expect("FATAL iptables error");
         }
     }
+
+    // ACL clean up thread
+    let acl_cache_thr = thread::spawn(move || {
+        thread::sleep(time::Duration::new(ACL_CACHE_DELAY, 0));
+        debug!("Investigating acl_cache staleness {:?}", acl_cache_clean.read().len());
+        match iptables::new(false) {
+            Err(_) => panic!("FATAL iptables error"),
+            Ok(ipt) => {
+                let mut short_stale = Vec::new();
+                let mut long_stale = Vec::new();
+                for (key,entry) in acl_cache_clean.read().iter() {
+                    if entry.short_active {
+                        if SystemTime::now() > entry.insert_ts + Duration::new(ACL_SHORT_TIMEOUT, 0) {
+                            short_stale.push(key.clone());
+                        }
+                    }
+                    if SystemTime::now() > entry.insert_ts + Duration::new(ACL_LONG_TIMEOUT, 0) {
+                        long_stale.push(key.clone());
+                    }
+                }
+
+                for key in short_stale.iter() {
+                    ipt_del_short(&ipt, &key).expect("FATAL iptables error");
+                    if let Some(entry) = acl_cache_clean.write().get_mut(key) {
+                        entry.short_active = false;
+                        entry.ts = SystemTime::now();
+                    }else{
+                        panic!("Failed to update acl_cache");
+                    }
+                }
+                for key in long_stale.iter() {
+                    ipt_del_long(&ipt, &key).expect("FATAL iptables error");
+                    ipt_del_chain(&ipt, &key).expect("FATAL iptables error");
+                    acl_cache_clean.write().remove(key);
+                    debug!("Deleted stale acl_cache entry {:?}", key);
+                }
+            }
+        }
+    });
+    threads.push(acl_cache_thr);
 
     let client_4_thr = thread::spawn(move || {
         // Setup DNS
@@ -491,8 +530,6 @@ fn handle_validation(acl_cache: Arc<RwLock<HashMap<String, AclCacheEntry>>>,
                                                                 insert_ts: SystemTime::now(),
                                                                 sni: sni.clone(),
                                                                 short_active: true,
-                                                                long_active: true,
-                                                                stale: false,
                                                             });
                                                         }
                                                     }
