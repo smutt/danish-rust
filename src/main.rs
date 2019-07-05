@@ -18,7 +18,7 @@ use tls_parser::tls;
 use tls_parser::tls_extensions;
 use trust_dns::client::{Client, SyncClient};
 use trust_dns::udp::UdpClientConnection;
-use trust_dns::op::DnsResponse;
+use trust_dns::op::{DnsResponse, ResponseCode};
 use trust_dns::rr::{DNSClass, Name, RecordType};
 use trust_dns::rr::RData::TLSA;
 use trust_dns::rr::rdata::tlsa::{CertUsage, Matching, Selector};
@@ -38,7 +38,7 @@ const IPT_MAX_CHARS: usize = 28; // maxchars for iptables chain names on Linux
 const CACHE_MIN_STALENESS: u64 = 10; // minimum seconds for a stale [client || server] cache entry to live before deletion
 const ACL_CACHE_DELAY: u64 = 10; // Sleep this many seconds between acl_cache cleanup cycles
 const ACL_SHORT_TIMEOUT: u64 = 60; // How many seconds do our short ACLs remain installed?
-const ACL_LONG_TIMEOUT: u64 = 90; // How many seconds do our long ACLs remain installed?
+const ACL_LONG_TIMEOUT: u64 = 600; // How many seconds do our long ACLs remain installed?
 
 // Types of errors we can generate from parse_cert()
 #[derive(Debug)]
@@ -461,30 +461,69 @@ fn dns_lookup_tlsa(resolver: String, client_cache: Arc<RwLock<HashMap<String, Cl
 
         let qname = "_443._tcp.".to_owned() + &client_cache.read().get(&key).unwrap().sni.clone();
         let name = Name::from_str(&qname).unwrap();
-        let response: DnsResponse = client.query(&name, DNSClass::IN, RecordType::TLSA).unwrap();
-        debug!("DNS response for {:?}", qname);
-//        debug!("Whole response {:?}", response);
-        if response.answers().len() == 0 {
-            debug!("{:?} TLSA returned NXDOMAIN", qname);
-            if let Some(entry) = client_cache.write().get_mut(&key) {
-                entry.response = true;
-                entry.stale = true;
-                entry.ts = SystemTime::now();
-            }else{
-                panic!("Failed to update client_cache");
+        let mut response: DnsResponse;
+        match client.query(&name, DNSClass::IN, RecordType::TLSA) {
+            Ok(resp) => response = resp,
+            Err(err) => {
+                warn!("DNS query failed for {:?} {:?}", qname, err);
+                if let Some(entry) = client_cache.write().get_mut(&key) {
+                    entry.response = true;
+                    entry.stale = true;
+                    entry.ts = SystemTime::now();
+                    return;
+                }else{
+                    panic!("Failed to update client_cache");
+                }
             }
-            debug!("Updated client_cache {:?}", key);
-        }else{
-            debug!("{:?} TLSA returned RRSET", qname);
-            if let Some(entry) = client_cache.write().get_mut(&key) {
-                entry.response = true;
-                entry.tlsa = Some(response.answers().iter().map(|rr| rr.rdata().clone()).collect::<Vec<_>>());
-                entry.ts = SystemTime::now();
-            }else{
-                panic!("Failed to update client_cache");
-            }
-            debug!("Updated client_cache {:?}", key);
         }
+
+        match response.response_code() {
+            ResponseCode::NoError => {
+                if response.answers().len() > 0 {
+                    debug!("{:?} TLSA returned RRSET", qname);
+                    if let Some(entry) = client_cache.write().get_mut(&key) {
+                        entry.response = true;
+                        entry.tlsa = Some(response.answers().iter().map(|rr| rr.rdata().clone()).collect::<Vec<_>>());
+                        entry.ts = SystemTime::now();
+                    }else{
+                        panic!("Failed to update client_cache");
+                    }
+                }else{
+                    warn!("{:?} TLSA returned empty NOERROR", qname);
+                }
+            },
+            ResponseCode::ServFail => {
+                debug!("{:?} TLSA returned SERVFAIL", qname);
+                if let Some(entry) = client_cache.write().get_mut(&key) {
+                    entry.response = true;
+                    entry.stale = true;
+                    entry.ts = SystemTime::now();
+                }else{
+                    panic!("Failed to update client_cache");
+                }
+            },
+            ResponseCode::NXDomain => {
+                debug!("{:?} TLSA returned NXDOMAIN", qname);
+                if let Some(entry) = client_cache.write().get_mut(&key) {
+                    entry.response = true;
+                    entry.stale = true;
+                    entry.ts = SystemTime::now();
+                }else{
+                    panic!("Failed to update client_cache");
+                }
+            },
+            _ => {
+                debug!("{:?} TLSA returned unexpected error", qname);
+                if let Some(entry) = client_cache.write().get_mut(&key) {
+                    entry.response = true;
+                    entry.stale = true;
+                    entry.ts = SystemTime::now();
+                }else{
+                    panic!("Failed to update client_cache");
+                }
+            },
+        }
+        debug!("Updated client_cache {:?}", key);
     });
 }
 
@@ -505,9 +544,9 @@ fn handle_validation(acl_cache: Arc<RwLock<HashMap<String, AclCacheEntry>>>,
                 match cl_cache.read().get(&key).unwrap().tlsa {
                     Some(ref tlsa) => {
                         if validate_tlsa(tlsa, &cert_chain) {
-                            debug!("TLSA for {:?} valid", sni);
+                            debug!("Valid TLSA for {:?}", sni);
                         }else{
-                            debug!("TLSA for {:?} invalid", sni);
+                            debug!("Invalid TLSA for {:?}", sni);
                             match iptables::new(false) {
                                 Err(err) => panic!("Fatal iptables error {:?}", err),
                                 Ok(ipt) => {
@@ -556,7 +595,7 @@ fn handle_validation(acl_cache: Arc<RwLock<HashMap<String, AclCacheEntry>>>,
                         break;
                     }
                     _ => {
-                        debug!("TLSA for {:?} NXDOMAIN", sni);
+                        debug!("Validation ignored for {:?}", sni);
                         break;
                     }
                 }
