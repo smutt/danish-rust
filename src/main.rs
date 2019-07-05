@@ -27,6 +27,7 @@ use rand::distributions::Alphanumeric;
 use resolv_conf::{Config, ScopedIp};
 use sha2::{Sha256, Sha512, Digest};
 use iptables;
+use x509_parser;
 
 // CONSTANTS
 const DNS_TIMEOUT: u64 = 1000; // Timeout for DNS queries in milliseconds, must be divisible by DNS_TIMEOUT_DECREMENT
@@ -656,7 +657,19 @@ fn validate_tlsa(tlsa_rrset: &Vec<trust_dns::rr::RData>, cert_chain: &Vec<Vec<u8
                 match tlsa.selector() {
                     Selector::Full => certs = cert_chain.clone(), // 0
                     Selector::Spki => { // 1
-                        certs = cert_chain.clone(); // TODO: Implement this
+                        certs = cert_chain.clone(); // TODO: remove these lines when I'm better at rust
+                        certs.clear();
+                        for cc in cert_chain.iter() {
+                            match x509_parser::parse_subject_public_key_info(cc) {
+                                Err(err) => {
+                                    warn!("Error parsing SPKI from X.509 record {:?} \n {:?}", err, cc);
+                                    return true; // Do no harm
+                                }
+                                Ok(spki) => {
+                                    certs.push(spki.1.subject_public_key.data.to_vec());
+                                }
+                            }
+                        }
                     }
                     _ => {
                         certs = cert_chain.clone();
