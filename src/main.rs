@@ -96,7 +96,7 @@ fn main() {
     //let ipv_enabled = false; // TODO: Make this configurable
 
     // Setup our caches
-    // TODO: We may get better cache entry atomicity if we use crate chashmap, need to investigate
+    // TODO: We may get better cache entry atomicity if we use crate chashmap
     let client_cache = Arc::new(RwLock::new(HashMap::<String, ClientCacheEntry>::new()));
     let client_cache_srv = Arc::clone(&client_cache);
     let mut server_cache: HashMap<String, ServerCacheEntry> = HashMap::new();
@@ -110,6 +110,33 @@ fn main() {
             ipt.new_chain("filter", IPT_CHAIN).expect("FATAL iptables error");
             ipt.insert_unique("filter", IPT_CHAIN, "-j RETURN", 1).expect("FATAL iptables error");
             ipt.insert_unique("filter", "OUTPUT", &format!("{} {}", "-j", IPT_CHAIN), 1).expect("FATAL iptables error");
+        }
+    }
+
+    // Discover our DNS resolver
+    let mut resolver: String;
+    match read_resolv_conf() {
+        Err(err) => panic!("Error reading /etc/resolv.conf {:?}", err),
+        Ok(resolv_conf_contents) => {
+            match Config::parse(resolv_conf_contents) {
+                Err(err) => panic!("Error parsing /etc/resolv.conf {:?}", err),
+                Ok(resolv_conf_parsed) => {
+                    let mut ii = 0;
+                    resolver = loop {
+                        if resolv_conf_parsed.nameservers.len() == ii {
+                            panic!("Zero IPv4 nameservers found in /etc/resolv.conf");
+                        }
+                        match resolv_conf_parsed.nameservers[ii] {
+                            ScopedIp::V4(ip) => {
+                                break ip.to_string() + ":53";
+                            }
+                            ScopedIp::V6(ref _ip, ref _scope) => (),
+                        }
+                        ii = ii + 1;
+                    };
+                    debug!("DNS resolver found: {:?}", resolver);
+                }
+            }
         }
     }
 
@@ -159,122 +186,96 @@ fn main() {
     threads.push(acl_cache_thr);
 
     let client_4_thr = thread::spawn(move || {
-        // Setup DNS
-        match read_resolv_conf() {
-            Err(err) => panic!("Error reading /etc/resolv.conf {:?}", err),
-            Ok(resolv_conf_contents) => {
-                match Config::parse(resolv_conf_contents) {
-                    Err(err) => panic!("Error parsing /etc/resolv.conf {:?}", err),
-                    Ok(resolv_conf_parsed) => {
-                        let mut ii = 0;
-                        let resolver = loop {
-                            if resolv_conf_parsed.nameservers.len() == ii {
-                                panic!("Zero IPv4 nameservers found in /etc/resolv.conf");
-                            }
-                            match resolv_conf_parsed.nameservers[ii] {
-                                ScopedIp::V4(ip) => {
-                                    break ip.to_string() + ":53";
-                                }
-                                ScopedIp::V6(ref _ip, ref _scope) => (),
-                            }
-                            ii = ii + 1;
-                        };
-                        debug!("DNS resolver found: {:?}", resolver);
+        // Setup pcap listen
+        // ACK == 1 && RST == 0 && SYN == 0 && FIN == 0 && must accept TCP fragments
+        let bpf_client_4 = "(tcp[((tcp[12:1] & 0xf0) >> 2)+5:1] = 0x01) and (tcp[((tcp[12:1] & 0xf0) >> 2):1] = 0x16) and (dst port 443)";
+        let mut client_cap = Device::lookup().unwrap().open().unwrap();
+        match client_cap.filter(bpf_client_4){
+            Ok(_) => (),
+            Err(err) => error!("BPF error {}", err.to_string()),
+        }
 
-                        // Setup pcap listen
-                        // ACK == 1 && RST == 0 && SYN == 0 && FIN == 0 && must accept TCP fragments
-                        let bpf_client_4 = "(tcp[((tcp[12:1] & 0xf0) >> 2)+5:1] = 0x01) and (tcp[((tcp[12:1] & 0xf0) >> 2):1] = 0x16) and (dst port 443)";
-                        let mut client_cap = Device::lookup().unwrap().open().unwrap();
-                        match client_cap.filter(bpf_client_4){
-                            Ok(_) => (),
-                            Err(err) => error!("BPF error {}", err.to_string()),
-                        }
+        while let Ok(packet) = client_cap.next() {
+            debug!("Investigating client_cache staleness {:?}", client_cache.read().len());
+            let mut stale = Vec::new();
+            for (key,entry) in client_cache.read().iter() {
+                if entry.stale {
+                    if entry.ts < SystemTime::now() - Duration::new(CACHE_MIN_STALENESS, 0) {
+                        stale.push(key.clone());
+                        debug!("Found stale client_cache entry {:?}", key);
+                    }
+                }
+            }
+            for key in stale.iter() {
+                client_cache.write().remove(key);
+                debug!("Deleted stale client_cache entry {:?}", key);
+            }
+            drop(stale);
 
-                        while let Ok(packet) = client_cap.next() {
-                            debug!("Investigating client_cache staleness {:?}", client_cache.read().len());
-                            let mut stale = Vec::new();
-                            for (key,entry) in client_cache.read().iter() {
-                                if entry.stale {
-                                    if entry.ts < SystemTime::now() - Duration::new(CACHE_MIN_STALENESS, 0) {
-                                        stale.push(key.clone());
-                                        debug!("Found stale client_cache entry {:?}", key);
-                                    }
-                                }
-                            }
-                            for key in stale.iter() {
-                                client_cache.write().remove(key);
-                                debug!("Deleted stale client_cache entry {:?}", key);
-                            }
-                            drop(stale);
+            let pkt = PacketHeaders::from_ethernet_slice(&packet).expect("Failed to decode packet");
+            //debug!("Everything: {:?}", pkt);
 
-                            let pkt = PacketHeaders::from_ethernet_slice(&packet).expect("Failed to decode packet");
-                            //debug!("Everything: {:?}", pkt);
+            let ip_src: [u8;4];
+            let ip_dst: [u8;4];
+            match pkt.ip.unwrap() {
+                Version6(_) => {
+                    warn!("IPv6 packet captured, but not yet implemented");
+                    continue;
+                }
+                Version4(ref value) => {
+                    ip_src = value.source;
+                    ip_dst = value.destination;
+                    match pkt.transport.unwrap() {
+                        Udp(_) => error!("UDP transport captured when TCP expected"),
+                        Tcp(ref value) => {
+                            match parse_sni(pkt.payload) { // We can assume SNI comes in one packet
+                                Err(_) => error!("Error parsing SNI"),
+                                Ok(sni) => {
+                                    let key = derive_cache_key(&ip_src, &ip_dst, &value.source_port);
+                                    debug!("Inserting client_cache entry: {:?} sni: {:?}", key, sni);
+                                    client_cache.write().insert(
+                                        derive_cache_key(&ip_src, &ip_dst, &value.source_port),
+                                        ClientCacheEntry {
+                                            ts: SystemTime::now(),
+                                            sni: sni.clone(),
+                                            tlsa: None,
+                                            response: false,
+                                            stale: false,
+                                        });
 
-                            let ip_src: [u8;4];
-                            let ip_dst: [u8;4];
-                            match pkt.ip.unwrap() {
-                                Version6(_) => {
-                                    warn!("IPv6 packet captured, but not yet implemented");
-                                    continue;
-                                }
-                                Version4(ref value) => {
-                                    ip_src = value.source;
-                                    ip_dst = value.destination;
-                                    match pkt.transport.unwrap() {
-                                        Udp(_) => error!("UDP transport captured when TCP expected"),
-                                        Tcp(ref value) => {
-                                            match parse_sni(pkt.payload) {
-                                                Err(_) => error!("Error parsing SNI"),
-                                                Ok(sni) => {
-                                                    let key = derive_cache_key(&ip_src, &ip_dst, &value.source_port);
-                                                    debug!("Inserting client_cache entry: {:?} sni: {:?}", key, sni);
-                                                    client_cache.write().insert(
-                                                        derive_cache_key(&ip_src, &ip_dst, &value.source_port),
-                                                        ClientCacheEntry {
-                                                            ts: SystemTime::now(),
-                                                            sni: sni.clone(),
-                                                            tlsa: None,
-                                                            response: false,
-                                                            stale: false,
-                                                        });
+                                    // Lookup TLSA record
+                                    let client_cache_dns = Arc::clone(&client_cache);
+                                    let resolver_dns = resolver.clone();
+                                    thread::spawn(move || {
+                                        let conn = UdpClientConnection::new(resolver_dns.parse().unwrap()).unwrap();
+                                        let client = SyncClient::new(conn);
 
-                                                    // Lookup TLSA record
-                                                    let client_cache_dns = Arc::clone(&client_cache);
-                                                    let resolver_dns = resolver.clone();
-                                                    thread::spawn(move || {
-                                                        let conn = UdpClientConnection::new(resolver_dns.parse().unwrap()).unwrap();
-                                                        let client = SyncClient::new(conn);
-
-                                                        let qname = "_443._tcp.".to_owned() + &sni.clone();
-                                                        let name = Name::from_str(&qname).unwrap();
-                                                        let response: DnsResponse = client.query(&name, DNSClass::IN, RecordType::TLSA).unwrap();
-                                                        debug!("DNS response for {:?}", qname);
-                                                        if response.answers().len() == 0 { // TODO: Get smarter about recognizing NXDOMAIN
-                                                            debug!("{:?} TLSA returned NXDOMAIN", qname);
-                                                            if let Some(entry) = client_cache_dns.write().get_mut(&key) {
-                                                                entry.response = true;
-                                                                entry.stale = true;
-                                                                entry.ts = SystemTime::now();
-                                                            }else{
-                                                                panic!("Failed to update client_cache_dns");
-                                                            }
-                                                            debug!("Updated client_cache_dns {:?}", client_cache_dns.read());
-                                                        }else{
-                                                            debug!("{:?} TLSA returned RRSET", qname);
-                                                            if let Some(entry) = client_cache_dns.write().get_mut(&key) {
-                                                                entry.response = true;
-                                                                entry.tlsa = Some(response.answers().iter().map(|rr| rr.rdata().clone()).collect::<Vec<_>>());
-                                                                entry.ts = SystemTime::now();
-                                                            }else{
-                                                                panic!("Failed to update client_cache_dns");
-                                                            }
-                                                            debug!("Updated client_cache_dns {:?}", client_cache_dns.read());
-                                                        }
-                                                    });
-                                                }
+                                        let qname = "_443._tcp.".to_owned() + &sni.clone();
+                                        let name = Name::from_str(&qname).unwrap();
+                                        let response: DnsResponse = client.query(&name, DNSClass::IN, RecordType::TLSA).unwrap();
+                                        debug!("DNS response for {:?}", qname);
+                                        if response.answers().len() == 0 { // TODO: Get smarter about recognizing NXDOMAIN
+                                            debug!("{:?} TLSA returned NXDOMAIN", qname);
+                                            if let Some(entry) = client_cache_dns.write().get_mut(&key) {
+                                                entry.response = true;
+                                                entry.stale = true;
+                                                entry.ts = SystemTime::now();
+                                            }else{
+                                                panic!("Failed to update client_cache_dns");
                                             }
+                                            debug!("Updated client_cache_dns {:?}", client_cache_dns.read());
+                                        }else{
+                                            debug!("{:?} TLSA returned RRSET", qname);
+                                            if let Some(entry) = client_cache_dns.write().get_mut(&key) {
+                                                entry.response = true;
+                                                entry.tlsa = Some(response.answers().iter().map(|rr| rr.rdata().clone()).collect::<Vec<_>>());
+                                                entry.ts = SystemTime::now();
+                                            }else{
+                                                panic!("Failed to update client_cache_dns");
+                                            }
+                                            debug!("Updated client_cache_dns {:?}", client_cache_dns.read());
                                         }
-                                    }
+                                    });
                                 }
                             }
                         }
