@@ -38,7 +38,7 @@ const IPT_MAX_CHARS: usize = 28; // maxchars for iptables chain names on Linux
 const CACHE_MIN_STALENESS: u64 = 10; // minimum seconds for a stale [client || server] cache entry to live before deletion
 const ACL_CACHE_DELAY: u64 = 10; // Sleep this many seconds between acl_cache cleanup cycles
 const ACL_SHORT_TIMEOUT: u64 = 60; // How many seconds do our short ACLs remain installed?
-const ACL_LONG_TIMEOUT: u64 = 600; // How many seconds do our long ACLs remain installed?
+const ACL_LONG_TIMEOUT: u64 = 90; // How many seconds do our long ACLs remain installed?
 
 // Types of errors we can generate from parse_cert()
 #[derive(Debug)]
@@ -93,6 +93,8 @@ fn main() {
 
     let mut threads = vec![]; // Our threads
 
+    //let ipv_enabled = false; // TODO: Make this configurable
+
     // Setup our caches
     // TODO: We may get better cache entry atomicity if we use crate chashmap, need to investigate
     let client_cache = Arc::new(RwLock::new(HashMap::<String, ClientCacheEntry>::new()));
@@ -113,38 +115,43 @@ fn main() {
 
     // ACL clean up thread
     let acl_cache_thr = thread::spawn(move || {
-        thread::sleep(time::Duration::new(ACL_CACHE_DELAY, 0));
-        debug!("Investigating acl_cache staleness {:?}", acl_cache_clean.read().len());
-        let mut short_stale = Vec::new();
-        let mut long_stale = Vec::new();
-        for (key,entry) in acl_cache_clean.read().iter() {
-            if entry.short_active {
-                if SystemTime::now() > entry.insert_ts + Duration::new(ACL_SHORT_TIMEOUT, 0) {
-                    short_stale.push(key.clone());
-                }
-            }
-            if SystemTime::now() > entry.insert_ts + Duration::new(ACL_LONG_TIMEOUT, 0) {
-                long_stale.push(key.clone());
-            }
-        }
-
-        match iptables::new(false) {
-            Err(_) => panic!("FATAL iptables error"),
-            Ok(ipt) => {
-                for key in short_stale.iter() {
-                    ipt_del_short(&ipt, &key).expect("FATAL iptables error");
-                    if let Some(entry) = acl_cache_clean.write().get_mut(key) {
-                        entry.short_active = false;
-                        entry.ts = SystemTime::now();
-                    }else{
-                        panic!("Failed to update acl_cache");
+        loop {
+            thread::sleep(time::Duration::new(ACL_CACHE_DELAY, 0));
+            debug!("Investigating acl_cache staleness {:?}", acl_cache_clean.read().len());
+            let mut short_stale = Vec::new();
+            let mut long_stale = Vec::new();
+            for (key,entry) in acl_cache_clean.read().iter() {
+                if entry.short_active {
+                    if SystemTime::now() > entry.insert_ts + Duration::new(ACL_SHORT_TIMEOUT, 0) {
+                        short_stale.push(key.clone());
                     }
                 }
-                for key in long_stale.iter() {
-                    ipt_del_long(&ipt, &key).expect("FATAL iptables error");
-                    ipt_del_chain(&ipt, &key).expect("FATAL iptables error");
-                    acl_cache_clean.write().remove(key);
-                    debug!("Deleted stale acl_cache entry {:?}", key);
+                if SystemTime::now() > entry.insert_ts + Duration::new(ACL_LONG_TIMEOUT, 0) {
+                    long_stale.push(key.clone());
+                }
+            }
+
+            if short_stale.len() > 0 || long_stale.len() > 0 {
+                match iptables::new(false) {
+                    Err(_) => panic!("FATAL iptables error"),
+                    Ok(ipt) => {
+                        debug!("Created ipt obj");
+                        for key in short_stale.iter() {
+                            ipt_del_short(&ipt, &key).expect("FATAL iptables error");
+                            if let Some(entry) = acl_cache_clean.write().get_mut(key) {
+                                entry.short_active = false;
+                                entry.ts = SystemTime::now();
+                            }else{
+                                panic!("Failed to update acl_cache");
+                            }
+                        }
+                        for key in long_stale.iter() {
+                            ipt_del_long(&ipt, &key).expect("FATAL iptables error");
+                            ipt_del_chain(&ipt, &key).expect("FATAL iptables error");
+                            acl_cache_clean.write().remove(key);
+                            debug!("Deleted stale acl_cache entry {:?}", key);
+                        }
+                    }
                 }
             }
         }
@@ -336,7 +343,7 @@ fn main() {
                             //debug!("payload_len: {:?}", resp_pkt.payload.len());
                             let key = derive_cache_key(&resp_ip_dst, &resp_ip_src, &tcp.destination_port);
                             if client_cache_srv.read().contains_key(&key) {
-                                debug!("Found client_cache key {:?}", key);
+                                //debug!("Found client_cache key {:?}", key);
 
                                 /* The Certificate TLS message may not be the first TLS message we receive.
                                 It will also likely span multiple TCP packets. Thus we need to test every payload
@@ -346,11 +353,11 @@ fn main() {
                                 match server_cache.get(&key) {
                                     Some(ref entry) => {
                                         if entry.cert_chain.is_some() {
-                                            debug!("Ignoring server_cache key {:?}", key);
+                                            //debug!("Ignoring server_cache key {:?}", key);
                                             continue;
                                         }
 
-                                        debug!("Found server_cache key {:?}", key);
+                                        //debug!("Found server_cache key {:?}", key);
                                         let mut raw_tls = entry.data.clone().unwrap();
                                         raw_tls.extend_from_slice(&resp_pkt.payload);
                                         match parse_cert(&raw_tls[..]) {
@@ -383,7 +390,7 @@ fn main() {
                                                                 stale: false,
                                                             });
                                                         }else{
-                                                            debug!("Out-of-order TCP datagrams detected"); // TODO
+                                                            debug!("Out-of-order TCP datagrams detected"); // TODO: This error doesn't tell the whole story
                                                         }
                                                     }
                                                 }
@@ -391,7 +398,7 @@ fn main() {
                                         }
                                     }
                                     _ => {
-                                        debug!("No server_cache key {:?}", key);
+                                        //debug!("No server_cache key {:?}", key);
                                         match parse_cert(&resp_pkt.payload) {
                                             Ok(cert_chain) => {
                                                 debug!("cert_len: {:?}", cert_chain.len());
@@ -589,9 +596,10 @@ fn ipt_del_chain(ipt: &iptables::IPTables, chain: &String) -> Result<(), iptable
 
 // Deletes short term ingress and egress ACLs in a chain
 fn ipt_del_short(ipt: &iptables::IPTables, chain: &String) -> Result<(), iptables::error::IPTError> {
+    debug!("Deleting short acls in chain {:?}", chain);
     for acl in ipt.list("filter", &chain)?.iter() {
-        if acl.contains("--destination") {
-            ipt.delete("filter", &chain, &acl)?;
+        if acl.contains("--sport") {
+            ipt.delete("filter", &chain, &acl.replace(&format!("{}{}", "-A ", &chain), ""))?;
         }
     }
     return Ok(());
@@ -599,9 +607,10 @@ fn ipt_del_short(ipt: &iptables::IPTables, chain: &String) -> Result<(), iptable
 
 // Deletes long term ACL in a chain
 fn ipt_del_long(ipt: &iptables::IPTables, chain: &String) -> Result<(), iptables::error::IPTError> {
+    debug!("Deleting long acl in chain {:?}", chain);
     for acl in ipt.list("filter", &chain)?.iter() {
         if acl.contains("--string") {
-            ipt.delete("filter", &chain, &acl)?;
+            ipt.delete("filter", &chain, &acl.replace(&format!("{}{}", "-A ", &chain), ""))?;
         }
     }
     return Ok(());
