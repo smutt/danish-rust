@@ -242,40 +242,8 @@ fn main() {
                                             response: false,
                                             stale: false,
                                         });
-
-                                    // Lookup TLSA record
-                                    let client_cache_dns = Arc::clone(&client_cache);
-                                    let resolver_dns = resolver.clone();
-                                    thread::spawn(move || {
-                                        let conn = UdpClientConnection::new(resolver_dns.parse().unwrap()).unwrap();
-                                        let client = SyncClient::new(conn);
-
-                                        let qname = "_443._tcp.".to_owned() + &sni.clone();
-                                        let name = Name::from_str(&qname).unwrap();
-                                        let response: DnsResponse = client.query(&name, DNSClass::IN, RecordType::TLSA).unwrap();
-                                        debug!("DNS response for {:?}", qname);
-                                        if response.answers().len() == 0 { // TODO: Get smarter about recognizing NXDOMAIN
-                                            debug!("{:?} TLSA returned NXDOMAIN", qname);
-                                            if let Some(entry) = client_cache_dns.write().get_mut(&key) {
-                                                entry.response = true;
-                                                entry.stale = true;
-                                                entry.ts = SystemTime::now();
-                                            }else{
-                                                panic!("Failed to update client_cache_dns");
-                                            }
-                                            debug!("Updated client_cache_dns {:?}", client_cache_dns.read());
-                                        }else{
-                                            debug!("{:?} TLSA returned RRSET", qname);
-                                            if let Some(entry) = client_cache_dns.write().get_mut(&key) {
-                                                entry.response = true;
-                                                entry.tlsa = Some(response.answers().iter().map(|rr| rr.rdata().clone()).collect::<Vec<_>>());
-                                                entry.ts = SystemTime::now();
-                                            }else{
-                                                panic!("Failed to update client_cache_dns");
-                                            }
-                                            debug!("Updated client_cache_dns {:?}", client_cache_dns.read());
-                                        }
-                                    });
+                                    // Lookup TLSA record and record response in client_cache entry
+                                    dns_lookup_tlsa(resolver.clone(), Arc::clone(&client_cache), key.clone());
                                 }
                             }
                         }
@@ -483,6 +451,41 @@ fn read_resolv_conf() -> Result<String, std::io::Error> {
     let mut contents = String::new();
     handle.read_to_string(&mut contents)?;
     return Ok(contents);
+}
+
+// Perform DNS TLSA lookup and update client_cache
+fn dns_lookup_tlsa(resolver: String, client_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>, key: String) {
+    thread::spawn(move || {
+        let conn = UdpClientConnection::new(resolver.parse().unwrap()).unwrap();
+        let client = SyncClient::new(conn);
+
+        let qname = "_443._tcp.".to_owned() + &client_cache.read().get(&key).unwrap().sni.clone();
+        let name = Name::from_str(&qname).unwrap();
+        let response: DnsResponse = client.query(&name, DNSClass::IN, RecordType::TLSA).unwrap();
+        debug!("DNS response for {:?}", qname);
+//        debug!("Whole response {:?}", response);
+        if response.answers().len() == 0 {
+            debug!("{:?} TLSA returned NXDOMAIN", qname);
+            if let Some(entry) = client_cache.write().get_mut(&key) {
+                entry.response = true;
+                entry.stale = true;
+                entry.ts = SystemTime::now();
+            }else{
+                panic!("Failed to update client_cache");
+            }
+            debug!("Updated client_cache {:?}", key);
+        }else{
+            debug!("{:?} TLSA returned RRSET", qname);
+            if let Some(entry) = client_cache.write().get_mut(&key) {
+                entry.response = true;
+                entry.tlsa = Some(response.answers().iter().map(|rr| rr.rdata().clone()).collect::<Vec<_>>());
+                entry.ts = SystemTime::now();
+            }else{
+                panic!("Failed to update client_cache");
+            }
+            debug!("Updated client_cache {:?}", key);
+        }
+    });
 }
 
 // Kicks off TLSA validation thread once X.509 cert has been received
