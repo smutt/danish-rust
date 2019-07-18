@@ -1,12 +1,8 @@
 #[macro_use]
 extern crate log;
 
-use std::str::FromStr;
 use std::{iter, time, thread};
 use std::time::{Duration, SystemTime};
-use std::io::prelude::*;
-use std::fs::File;
-use std::path::Path;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -16,15 +12,10 @@ use etherparse::IpHeader::*;
 use etherparse::TransportHeader::*;
 use tls_parser::tls;
 use tls_parser::tls_extensions;
-use trust_dns::client::{Client, SyncClient};
-use trust_dns::udp::UdpClientConnection;
-use trust_dns::op::{DnsResponse, ResponseCode};
-use trust_dns::rr::{DNSClass, Name, RecordType};
-use trust_dns::rr::RData::TLSA;
-use trust_dns::rr::rdata::tlsa::{CertUsage, Matching, Selector};
+use resolv::{Resolver, Class, RecordType};
+use resolv::record::TLSA;
 use rand::{Rng, thread_rng};
 use rand::distributions::Alphanumeric;
-use resolv_conf::{Config, ScopedIp};
 use sha2::{Sha256, Sha512, Digest};
 use iptables;
 use x509_parser;
@@ -61,7 +52,7 @@ enum SniParseError {
 struct ClientCacheEntry { 
     ts: SystemTime, // Last touched timestamp
     sni: String, // SNI
-    tlsa: Option<Vec<trust_dns::rr::RData>>, // DNS TLSA RRSET
+    tlsa: Option<Vec<TLSA>>, // DNS TLSA RRSET
     response: bool, // Have we queried and gotten a response yet?
     stale: bool, // Entry can be deleted at next cleanup
 }
@@ -110,33 +101,6 @@ fn main() {
             ipt.new_chain("filter", IPT_CHAIN).expect("FATAL iptables error");
             ipt.insert_unique("filter", IPT_CHAIN, "-j RETURN", 1).expect("FATAL iptables error");
             ipt.insert_unique("filter", "OUTPUT", &format!("{} {}", "-j", IPT_CHAIN), 1).expect("FATAL iptables error");
-        }
-    }
-
-    // Discover our DNS resolver
-    let mut resolver: String;
-    match read_resolv_conf() {
-        Err(err) => panic!("Error reading /etc/resolv.conf {:?}", err),
-        Ok(resolv_conf_contents) => {
-            match Config::parse(resolv_conf_contents) {
-                Err(err) => panic!("Error parsing /etc/resolv.conf {:?}", err),
-                Ok(resolv_conf_parsed) => {
-                    let mut ii = 0;
-                    resolver = loop {
-                        if resolv_conf_parsed.nameservers.len() == ii {
-                            panic!("Zero IPv4 nameservers found in /etc/resolv.conf");
-                        }
-                        match resolv_conf_parsed.nameservers[ii] {
-                            ScopedIp::V4(ip) => {
-                                break ip.to_string() + ":53";
-                            }
-                            ScopedIp::V6(ref _ip, ref _scope) => (),
-                        }
-                        ii = ii + 1;
-                    };
-                    debug!("DNS resolver found: {:?}", resolver);
-                }
-            }
         }
     }
 
@@ -243,7 +207,7 @@ fn main() {
                                             stale: false,
                                         });
                                     // Lookup TLSA record and record response in client_cache entry
-                                    dns_lookup_tlsa(resolver.clone(), Arc::clone(&client_cache), key.clone());
+                                    dns_lookup_tlsa(Arc::clone(&client_cache), key.clone());
                                 }
                             }
                         }
@@ -444,84 +408,31 @@ fn euthanize() {
     std::process::exit(0);
 }
 
-// Return contents of /etc/resolv.conf or Err
-fn read_resolv_conf() -> Result<String, std::io::Error> {
-    let path = Path::new("/etc/resolv.conf");
-    let mut handle = File::open(path)?;
-    let mut contents = String::new();
-    handle.read_to_string(&mut contents)?;
-    return Ok(contents);
-}
-
 // Perform DNS TLSA lookup and update client_cache
-fn dns_lookup_tlsa(resolver: String, client_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>, key: String) {
+fn dns_lookup_tlsa(client_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>, key: String) {
     thread::spawn(move || {
-        let conn = UdpClientConnection::new(resolver.parse().unwrap()).unwrap();
-        let client = SyncClient::new(conn);
-
         let qname = "_443._tcp.".to_owned() + &client_cache.read().get(&key).unwrap().sni.clone();
-        let name = Name::from_str(&qname).unwrap();
-        let mut response: DnsResponse;
-        match client.query(&name, DNSClass::IN, RecordType::TLSA) {
-            Ok(resp) => response = resp,
-            Err(err) => {
-                warn!("DNS query failed for {:?} {:?}", qname, err);
+
+        let mut resolver = Resolver::new().unwrap();
+        match resolver.query(&qname.into_bytes(), Class::IN, RecordType::TLSA) {
+            Ok(mut response) => {
+                if let Some(entry) = client_cache.write().get_mut(&key) {
+                    entry.response = true;
+                    entry.tlsa = Some(response.answers::<TLSA>().map(|t| t.data).collect::<Vec<_>>());
+                    entry.ts = SystemTime::now();
+                }else{
+                    panic!("Failed to update client_cache");
+                }
+            },
+            Err(_err) => {
                 if let Some(entry) = client_cache.write().get_mut(&key) {
                     entry.response = true;
                     entry.stale = true;
                     entry.ts = SystemTime::now();
-                    return;
                 }else{
                     panic!("Failed to update client_cache");
                 }
             }
-        }
-
-        match response.response_code() {
-            ResponseCode::NoError => {
-                if response.answers().len() > 0 {
-                    debug!("{:?} TLSA returned RRSET", qname);
-                    if let Some(entry) = client_cache.write().get_mut(&key) {
-                        entry.response = true;
-                        entry.tlsa = Some(response.answers().iter().map(|rr| rr.rdata().clone()).collect::<Vec<_>>());
-                        entry.ts = SystemTime::now();
-                    }else{
-                        panic!("Failed to update client_cache");
-                    }
-                }else{
-                    warn!("{:?} TLSA returned empty NOERROR", qname);
-                }
-            },
-            ResponseCode::ServFail => {
-                debug!("{:?} TLSA returned SERVFAIL", qname);
-                if let Some(entry) = client_cache.write().get_mut(&key) {
-                    entry.response = true;
-                    entry.stale = true;
-                    entry.ts = SystemTime::now();
-                }else{
-                    panic!("Failed to update client_cache");
-                }
-            },
-            ResponseCode::NXDomain => {
-                debug!("{:?} TLSA returned NXDOMAIN", qname);
-                if let Some(entry) = client_cache.write().get_mut(&key) {
-                    entry.response = true;
-                    entry.stale = true;
-                    entry.ts = SystemTime::now();
-                }else{
-                    panic!("Failed to update client_cache");
-                }
-            },
-            _ => {
-                debug!("{:?} TLSA returned unexpected error", qname);
-                if let Some(entry) = client_cache.write().get_mut(&key) {
-                    entry.response = true;
-                    entry.stale = true;
-                    entry.ts = SystemTime::now();
-                }else{
-                    panic!("Failed to update client_cache");
-                }
-            },
         }
         debug!("Updated client_cache {:?}", key);
     });
@@ -699,109 +610,104 @@ fn gen_chain_name(sni: &str) -> String {
 // Validates X.509 cert against TLSA 
 // Takes RData of DNS TLSA RRSET and DER encoded X.509 cert chain
 // Returns True on valid and False on invalid
-fn validate_tlsa(tlsa_rrset: &Vec<trust_dns::rr::RData>, cert_chain: &Vec<Vec<u8>>) -> bool {
+fn validate_tlsa(tlsa_rrset: &Vec<TLSA>, cert_chain: &Vec<Vec<u8>>) -> bool {
     debug!("Entered validate_tlsa() tlsa_rrset: {:?}", tlsa_rrset);
     let mut certs: Vec<Vec<u8>>;
-    for rr in tlsa_rrset {
-        debug!("tlsa: {:?}", rr);
-        match rr{
-            TLSA(tlsa) => {
-                match tlsa.selector() {
-                    Selector::Full => certs = cert_chain.clone(), // 0
-                    Selector::Spki => { // 1
-                        certs = cert_chain.clone(); // TODO: remove these lines when I'm better at rust
-                        certs.clear();
-                        for cc in cert_chain.iter() {
-                            match x509_parser::parse_subject_public_key_info(cc) {
-                                Err(err) => {
-                                    warn!("Error parsing SPKI from X.509 record {:?} \n {:?}", err, cc);
-                                    return true; // Do no harm
-                                }
-                                Ok(spki) => {
-                                    certs.push(spki.1.subject_public_key.data.to_vec());
-                                }
-                            }
+    for tlsa in tlsa_rrset {
+        debug!("tlsa: {:?}", tlsa);
+        match tlsa.selector {
+            0 => certs = cert_chain.clone(),
+            1 => {
+                certs = cert_chain.clone(); // TODO: remove these lines when I'm better at rust
+                certs.clear();
+                for cc in cert_chain.iter() {
+                    match x509_parser::parse_subject_public_key_info(cc) {
+                        Err(err) => {
+                            warn!("Error parsing SPKI from X.509 record {:?} \n {:?}", err, cc);
+                            return true; // Do no harm
+                        }
+                        Ok(spki) => {
+                            certs.push(spki.1.subject_public_key.data.to_vec());
                         }
                     }
-                    _ => {
-                        certs = cert_chain.clone();
-                        debug!("Invalid TLSA selector, assuming Full");
-                    }
-                }
-
-                match tlsa.cert_usage() {
-                    CertUsage::CA => {
-                        match tlsa.matching() {
-                            Matching::Sha256 => {
-                                for cert in certs {
-                                    if tlsa.cert_data() == Sha256::digest(&cert).as_slice() {
-                                        return true;
-                                    }
-                                }
-                            }
-                            Matching::Sha512 => {
-                                for cert in certs {
-                                    if tlsa.cert_data() == Sha512::digest(&cert).as_slice() {
-                                        return true;
-                                    }
-                                }
-                            }
-                            Matching::Raw => {
-                                for cert in certs {
-                                    if tlsa.cert_data() == cert.as_slice() {
-                                        return true;
-                                    }
-                                }
-                            }
-                            _ => debug!("Unsupported TLSA::Matching {:?}", tlsa.matching()),
-                        }
-                    }
-                    CertUsage::Service | CertUsage::DomainIssued => {
-                        match tlsa.matching() {
-                            Matching::Sha256 => {
-                                debug!("hash: {:?}", Sha256::digest(&certs[0]));
-                                if tlsa.cert_data() == Sha256::digest(&certs[0]).as_slice(){
-                                    return true;
-                                }
-                            }
-                            Matching::Sha512 => {
-                                debug!("hash: {:?}", Sha512::digest(&certs[0]));
-                                if tlsa.cert_data() == Sha512::digest(&certs[0]).as_slice() {
-                                    return true;
-                                }
-                            }
-                            Matching::Raw => {
-                                if tlsa.cert_data() == certs[0].as_slice() {
-                                    return true;
-                                }
-                            }
-                            _ => debug!("Unsupported TLSA::Matching {:?}", tlsa.matching()),
-                        }
-                    }
-                    CertUsage::TrustAnchor => {
-                        match tlsa.matching() {
-                            Matching::Sha256 => {
-                                if tlsa.cert_data() == Sha256::digest(&certs[certs.len()-1]).as_slice() {
-                                    return true;
-                                }
-                            }
-                            Matching::Sha512 => {
-                                if tlsa.cert_data() == Sha512::digest(&certs[certs.len()-1]).as_slice() {
-                                    return true;
-                                }
-                            }
-                            Matching::Raw => {
-                                if tlsa.cert_data() == certs[certs.len()-1].as_slice() {
-                                    return true;
-                                }
-                            }
-                            _ => debug!("Unsupported TLSA::Matching {:?}", tlsa.matching()),
-                        }
-                    }
-                    _ => debug!("Unsupported TLSA::CertUsage {:?}", tlsa.cert_usage()),
                 }
             }
-            _ => debug!("RRSET contains non-TLSA RR"),
+            _ => {
+                debug!("Invalid TLSA selector, assuming Full");
+                certs = cert_chain.clone();
+            }
+        }
+
+        match tlsa.usage {
+            0 => {
+                match tlsa.matching_type {
+                    0 => {
+                        for cert in certs {
+                            if tlsa.data == cert.as_slice() {
+                                return true;
+                            }
+                        }
+                    }
+                    1 => {
+                        for cert in certs {
+                            if tlsa.data == Sha256::digest(&cert).as_slice() {
+                                return true;
+                            }
+                        }
+                    }
+                    2 => {
+                        for cert in certs {
+                            if tlsa.data == Sha512::digest(&cert).as_slice() {
+                                return true;
+                            }
+                        }
+                    }
+                    _ => debug!("Unsupported TLSA::matching_type {:?}", tlsa.matching_type),
+                }
+            }
+            1 | 3 => {
+                match tlsa.matching_type {
+                    0 => {
+                        if tlsa.data == certs[0].as_slice() {
+                            return true;
+                        }
+                    }
+                    1 => {
+                        debug!("hash: {:?}", Sha256::digest(&certs[0]));
+                        if tlsa.data == Sha256::digest(&certs[0]).as_slice(){
+                            return true;
+                        }
+                    }
+                    2 => {
+                        debug!("hash: {:?}", Sha512::digest(&certs[0]));
+                        if tlsa.data == Sha512::digest(&certs[0]).as_slice() {
+                            return true;
+                        }
+                    }
+                    _ => debug!("Unsupported TLSA::matching_type {:?}", tlsa.matching_type),
+                }
+            }
+            2 => {
+                match tlsa.matching_type {
+                    0 => {
+                        if tlsa.data == certs[certs.len()-1].as_slice() {
+                            return true;
+                        }
+                    }
+                    1 => {
+                        if tlsa.data == Sha256::digest(&certs[certs.len()-1]).as_slice() {
+                            return true;
+                        }
+                    }
+                    2 => {
+                        if tlsa.data == Sha512::digest(&certs[certs.len()-1]).as_slice() {
+                            return true;
+                        }
+                    }
+                    _ => debug!("Unsupported TLSA::matching_type {:?}", tlsa.matching_type),
+                }
+            }
+            _ => debug!("Unsupported TLSA::usage {:?}", tlsa.usage),
         }
     }
     return false;
