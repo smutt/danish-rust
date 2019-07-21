@@ -31,7 +31,7 @@ const CACHE_MIN_STALENESS: u64 = 10; // minimum seconds for a stale [client || s
 const ACL_CACHE_DELAY: u64 = 10; // Sleep this many seconds between acl_cache cleanup cycles
 const ACL_SHORT_TIMEOUT: u64 = 60; // How many seconds do our short ACLs remain installed?
 const ACL_LONG_TIMEOUT: u64 = 600; // How many seconds do our long ACLs remain installed?
-
+const IPV6TABLES_DIRS: [&str; 6] = ["/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin"]; // Where we might find ip6tables executable
 // Types of errors we can generate from parse_cert()
 #[derive(Debug)]
 enum CertParseError {
@@ -85,29 +85,13 @@ fn main() {
 
     let mut threads = vec![]; // Our threads
 
-    // Is this machine IPv6 capable?
-    // TODO: For now we only check if ip6tables exists, could be smarter maybe
-    let mut ipv6_enabled: bool = false;
-    let mut simp = Simpath::new("PATH");
-    simp.add_directory("/bin/");
-    simp.add_directory("/sbin/");
-    simp.add_directory("/usr/bin/");
-    simp.add_directory("/usr/sbin");
-    simp.add_directory("/usr/local/bin");
-    simp.add_directory("/usr/local/sbin");
-    match simp.find("ip6tables") {
-        Ok(_) => ipv6_enabled = true,
-        Err(_) => ipv6_enabled = false,
-    }
-    drop(simp);
-
     // Setup our caches
     // TODO: We may get better cache entry atomicity if we use crate chashmap
     let client_cache_v4 = Arc::new(RwLock::new(HashMap::<String, ClientCacheEntry>::new()));
     let client_cache_v4_srv = Arc::clone(&client_cache_v4); // Reference for server_4_thr
     let mut server_cache_v4: HashMap<String, ServerCacheEntry> = HashMap::new();
 
-    if ipv6_enabled {
+    if ipv6_enabled() {
         let client_cache_v6 = Arc::new(RwLock::new(HashMap::<String, ClientCacheEntry>::new()));
         let client_cache_v6_srv = Arc::clone(&client_cache_v6); // Reference for server_6_thr
         let mut server_cache_v6: HashMap<String, ServerCacheEntry> = HashMap::new();
@@ -123,6 +107,16 @@ fn main() {
             ipt.new_chain("filter", IPT_CHAIN).expect("FATAL iptables error");
             ipt.insert_unique("filter", IPT_CHAIN, "-j RETURN", 1).expect("FATAL iptables error");
             ipt.insert_unique("filter", "OUTPUT", &format!("{} {}", "-j", IPT_CHAIN), 1).expect("FATAL iptables error");
+            if ipv6_enabled() {
+                match iptables::new(true) {
+                    Err(_) => panic!("FATAL ip6tables error"),
+                    Ok(ipt6) => {
+                        ipt6.new_chain("filter", IPT_CHAIN).expect("FATAL ip6tables error");
+                        ipt6.insert_unique("filter", IPT_CHAIN, "-j RETURN", 1).expect("FATAL ip6tables error");
+                        ipt6.insert_unique("filter", "OUTPUT", &format!("{} {}", "-j", IPT_CHAIN), 1).expect("FATAL ip6tables error");
+                    }
+                }
+            }
         }
     }
 
@@ -285,7 +279,7 @@ fn main() {
 
             match resp_pkt.ip.unwrap() {
                 Version6(_) => {
-                    warn!("IPv6 packet captured, but not yet implemented");
+                    warn!("IPv6 packet captured, but IPv4 expected");
                     continue;
                 }
                 Version4(ref value) => {
@@ -427,6 +421,27 @@ fn euthanize() {
         }
     }
 
+    // teardown ip6tables
+    if ipv6_enabled() {
+        match iptables::new(true) {
+            Err(_) => panic!("FATAL ip6tables error"),
+            Ok(ipt) => {
+                ipt.delete("filter", "OUTPUT", &format!("{} {}", "-j", IPT_CHAIN)).expect("FATAL ip6tables error");
+                let sub_chains = ipt.list_chains("filter").expect("FATAL ip6tables error");
+                ipt.flush_chain("filter", IPT_CHAIN).expect("FATAL ip6tables error");
+
+                for chain in sub_chains.iter() {
+                    if chain.starts_with(&format!("{}{}", IPT_CHAIN, IPT_DELIM)) { // TODO: Use AclCache to do this better
+                        ipt.flush_chain("filter", chain).expect("FATAL ip6tables error");
+                        ipt.delete_chain("filter", chain).expect("FATAL ip6tables error");
+                    }
+                }
+
+                ipt.delete_chain("filter", IPT_CHAIN).expect("FATAL ip6tables error");
+            }
+        }
+    }
+
     std::process::exit(0);
 }
 
@@ -480,25 +495,10 @@ fn handle_validation(acl_cache: Arc<RwLock<HashMap<String, AclCacheEntry>>>,
                             debug!("Valid TLSA for {:?}", sni);
                         }else{
                             debug!("Invalid TLSA for {:?}", sni);
-                            match iptables::new(false) {
+                            let chain = unique_chain_name(&sni);
+                            match iptables::new(false) { // Create iptables chains, insert ACLs and create acl_cache entry
                                 Err(err) => panic!("Fatal iptables error {:?}", err),
                                 Ok(ipt) => {
-                                    let chain = loop { // Ensure our chain name is unique
-                                        let mut strn = sni.clone();
-                                        let attempt = gen_chain_name(&strn);
-                                        for existing in ipt.list_chains("filter").expect("FATAL iptables error").iter() {
-                                            if &attempt == existing {
-                                                debug!("iptables chain already exists {:?} {:?}", sni, attempt);
-                                                let mut rng = thread_rng(); // Generate random strn
-                                                strn = iter::repeat(())
-                                                    .map(|()| rng.sample(Alphanumeric)).take(strn.len()).collect();
-                                                continue;
-                                            }
-                                        }
-                                        break attempt;
-                                    };
-
-                                    // Create iptables chains, insert ACLs and create acl_cache entry
                                     match ipt_add_chain(&ipt, &chain) { 
                                         Err(err) => panic!("Fatal iptables error at add_chain {:?}", err),
                                         Ok(_) => {
@@ -619,14 +619,6 @@ fn ipt_add_v4_long(ipt: &iptables::IPTables, chain: &String, sni: &String) -> Re
 // Returns display formatted string for ipv4 address
 fn ipv4_display(ip: &[u8;4]) -> String {
     return ip.iter().map(|x| format!(".{}", x)).collect::<String>().split_off(1);
-}
-
-// Generates an iptables chain name from passed SNI
-fn gen_chain_name(sni: &str) -> String {
-    let id_len: usize = (IPT_MAX_CHARS - IPT_CHAIN.len() - IPT_DELIM.len()) / 2;
-    let hash = Sha256::digest(&sni.as_bytes()).to_vec()[0..id_len].to_vec();
-    return format!("{}{}{}", IPT_CHAIN, IPT_DELIM,
-                   hash.iter().map(|x| format!("{:x}", x)).collect::<String>());
 }
 
 // Validates X.509 cert against TLSA 
@@ -810,4 +802,57 @@ fn derive_cache_key(src: &[u8;4], dst: &[u8;4], port: &u16) -> String {
     }
     key.push_str(&port.to_string());
     key
+}
+
+// Is this machine IPv6 capable?
+// TODO: For now we only check if ip6tables exists, could be smarter maybe
+fn ipv6_enabled() -> bool {
+    let mut simp = Simpath::new("PATH");
+    for dir in IPV6TABLES_DIRS.iter() {
+        simp.add_directory(dir)
+    }
+    match simp.find("ip6tables") {
+        Ok(_) => return true,
+        Err(_) => return false,
+    }
+}
+
+// Returns an unused iptables and ip6tables chain name
+fn unique_chain_name(name: &str) -> String {
+    let id_len: usize = (IPT_MAX_CHARS - IPT_CHAIN.len() - IPT_DELIM.len()) / 2;
+    let hash = Sha256::digest(&name.as_bytes()).to_vec()[0..id_len].to_vec();
+    let attempt = format!("{}{}{}", IPT_CHAIN, IPT_DELIM,
+                          hash.iter().map(|x| format!("{:x}", x)).collect::<String>());
+
+    match iptables::new(false) {
+        Err(err) => panic!("Fatal iptables error {:?}", err),
+        Ok(ipt) => {
+            for existing in ipt.list_chains("filter").expect("FATAL iptables error").iter() {
+                if &attempt == existing {
+                    debug!("iptables chain already exists {:?}", attempt);
+                    let mut rng = thread_rng();
+                    return unique_chain_name(&iter::repeat(())
+                                             .map(|()| rng.sample(Alphanumeric)).take(attempt.len())
+                                             .fold(String::new(), |a, b| format!("{}{}", a, b)));
+                }
+            }
+        }
+    }
+    if ipv6_enabled() {
+        match iptables::new(true) {
+            Err(err) => panic!("Fatal ip6tables error {:?}", err),
+            Ok(ipt6) => {
+                for existing in ipt6.list_chains("filter").expect("FATAL ip6tables error").iter() {
+                    if &attempt == existing {
+                        debug!("ip6tables chain already exists {:?}", attempt);
+                        let mut rng = thread_rng();
+                        return unique_chain_name(&iter::repeat(())
+                                                 .map(|()| rng.sample(Alphanumeric)).take(attempt.len())
+                                                 .fold(String::new(), |a, b| format!("{}{}", a, b)));
+                    }
+                }
+            }
+        }
+    }
+    return attempt;
 }
