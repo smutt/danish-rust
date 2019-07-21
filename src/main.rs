@@ -19,6 +19,7 @@ use rand::distributions::Alphanumeric;
 use sha2::{Sha256, Sha512, Digest};
 use iptables;
 use x509_parser;
+use simpath::Simpath;
 
 // CONSTANTS
 const DNS_TIMEOUT: u64 = 1000; // Timeout for DNS queries in milliseconds, must be divisible by DNS_TIMEOUT_DECREMENT
@@ -84,15 +85,36 @@ fn main() {
 
     let mut threads = vec![]; // Our threads
 
-    //let ipv_enabled = false; // TODO: Make this configurable
+    // Is this machine IPv6 capable?
+    // TODO: For now we only check if ip6tables exists, could be smarter maybe
+    let mut ipv6_enabled: bool = false;
+    let mut simp = Simpath::new("PATH");
+    simp.add_directory("/bin/");
+    simp.add_directory("/sbin/");
+    simp.add_directory("/usr/bin/");
+    simp.add_directory("/usr/sbin");
+    simp.add_directory("/usr/local/bin");
+    simp.add_directory("/usr/local/sbin");
+    match simp.find("ip6tables") {
+        Ok(_) => ipv6_enabled = true,
+        Err(_) => ipv6_enabled = false,
+    }
+    drop(simp);
 
     // Setup our caches
     // TODO: We may get better cache entry atomicity if we use crate chashmap
-    let client_cache = Arc::new(RwLock::new(HashMap::<String, ClientCacheEntry>::new()));
-    let client_cache_srv = Arc::clone(&client_cache);
-    let mut server_cache: HashMap<String, ServerCacheEntry> = HashMap::new();
+    let client_cache_v4 = Arc::new(RwLock::new(HashMap::<String, ClientCacheEntry>::new()));
+    let client_cache_v4_srv = Arc::clone(&client_cache_v4); // Reference for server_4_thr
+    let mut server_cache_v4: HashMap<String, ServerCacheEntry> = HashMap::new();
+
+    if ipv6_enabled {
+        let client_cache_v6 = Arc::new(RwLock::new(HashMap::<String, ClientCacheEntry>::new()));
+        let client_cache_v6_srv = Arc::clone(&client_cache_v6); // Reference for server_6_thr
+        let mut server_cache_v6: HashMap<String, ServerCacheEntry> = HashMap::new();
+    }
+
     let acl_cache = Arc::new(RwLock::new(HashMap::<String, AclCacheEntry>::new()));
-    let acl_cache_clean = Arc::clone(&acl_cache);
+    let acl_cache_clean = Arc::clone(&acl_cache); // Reference for acl_clean_thr
 
     // Setup iptables
     match iptables::new(false) {
@@ -105,7 +127,7 @@ fn main() {
     }
 
     // ACL clean up thread
-    let acl_cache_thr = thread::spawn(move || {
+    let acl_clean_thr = thread::spawn(move || {
         loop {
             thread::sleep(time::Duration::new(ACL_CACHE_DELAY, 0));
             debug!("Investigating acl_cache staleness {:?}", acl_cache_clean.read().len());
@@ -147,7 +169,7 @@ fn main() {
             }
         }
     });
-    threads.push(acl_cache_thr);
+    threads.push(acl_clean_thr);
 
     let client_4_thr = thread::spawn(move || {
         // Setup pcap listen
@@ -160,19 +182,19 @@ fn main() {
         }
 
         while let Ok(packet) = client_cap.next() {
-            debug!("Investigating client_cache staleness {:?}", client_cache.read().len());
+            debug!("Investigating client_cache_v4 staleness {:?}", client_cache_v4.read().len());
             let mut stale = Vec::new();
-            for (key,entry) in client_cache.read().iter() {
+            for (key,entry) in client_cache_v4.read().iter() {
                 if entry.stale {
                     if entry.ts < SystemTime::now() - Duration::new(CACHE_MIN_STALENESS, 0) {
                         stale.push(key.clone());
-                        debug!("Found stale client_cache entry {:?}", key);
+                        debug!("Found stale client_cache_v4 entry {:?}", key);
                     }
                 }
             }
             for key in stale.iter() {
-                client_cache.write().remove(key);
-                debug!("Deleted stale client_cache entry {:?}", key);
+                client_cache_v4.write().remove(key);
+                debug!("Deleted stale client_cache_v4 entry {:?}", key);
             }
             drop(stale);
 
@@ -183,7 +205,7 @@ fn main() {
             let ip_dst: [u8;4];
             match pkt.ip.unwrap() {
                 Version6(_) => {
-                    warn!("IPv6 packet captured, but not yet implemented");
+                    warn!("IPv6 packet captured when IPv4 expected");
                     continue;
                 }
                 Version4(ref value) => {
@@ -196,8 +218,8 @@ fn main() {
                                 Err(_) => error!("Error parsing SNI"),
                                 Ok(sni) => {
                                     let key = derive_cache_key(&ip_src, &ip_dst, &value.source_port);
-                                    debug!("Inserting client_cache entry: {:?} sni: {:?}", key, sni);
-                                    client_cache.write().insert(
+                                    debug!("Inserting client_cache_v4 entry: {:?} sni: {:?}", key, sni);
+                                    client_cache_v4.write().insert(
                                         derive_cache_key(&ip_src, &ip_dst, &value.source_port),
                                         ClientCacheEntry {
                                             ts: SystemTime::now(),
@@ -206,8 +228,8 @@ fn main() {
                                             response: false,
                                             stale: false,
                                         });
-                                    // Lookup TLSA record and record response in client_cache entry
-                                    dns_lookup_tlsa(Arc::clone(&client_cache), key.clone());
+                                    // Lookup TLSA record and record response in client_cache_v4 entry
+                                    dns_lookup_tlsa(Arc::clone(&client_cache_v4), key.clone());
                                 }
                             }
                         }
@@ -230,19 +252,19 @@ fn main() {
         }
 
         while let Ok(resp_packet) = server_cap.next() {
-            debug!("Investigating server_cache staleness {:?}", server_cache.len());
+            debug!("Investigating server_cache_v4 staleness {:?}", server_cache_v4.len());
             let mut stale = Vec::new();
-            for (key,entry) in server_cache.iter() {
+            for (key,entry) in server_cache_v4.iter() {
                 if entry.stale {
                     if entry.ts < SystemTime::now() - Duration::new(CACHE_MIN_STALENESS, 0) {
                         stale.push(key.clone());
-                        debug!("Found stale server_cache entry {:?}", key);
+                        debug!("Found stale server_cache_v4 entry {:?}", key);
                     }
                 }
             }
             for key in stale.iter() {
-                server_cache.remove(key);
-                debug!("Deleted stale server_cache entry {:?}", key);
+                server_cache_v4.remove(key);
+                debug!("Deleted stale server_cache_v4 entry {:?}", key);
             }
             drop(stale);
 
@@ -275,7 +297,7 @@ fn main() {
                             //debug!("resp_tcp_seq: {:?}", tcp.sequence_number);
                             //debug!("payload_len: {:?}", resp_pkt.payload.len());
                             let key = derive_cache_key(&resp_ip_dst, &resp_ip_src, &tcp.destination_port);
-                            if client_cache_srv.read().contains_key(&key) {
+                            if client_cache_v4_srv.read().contains_key(&key) {
                                 //debug!("Found client_cache key {:?}", key);
 
                                 /* The Certificate TLS message may not be the first TLS message we receive.
@@ -283,14 +305,14 @@ fn main() {
                                 received to see if it is complete, if not we need to store it until we get the
                                 next segment and test completeness again. If it is complete, but still not a
                                 Certificate TLS message we need to flush cache and start waiting again. */
-                                match server_cache.get(&key) {
+                                match server_cache_v4.get(&key) {
                                     Some(ref entry) => {
                                         if entry.cert_chain.is_some() {
-                                            //debug!("Ignoring server_cache key {:?}", key);
+                                            //debug!("Ignoring server_cache_v4 key {:?}", key);
                                             continue;
                                         }
 
-                                        //debug!("Found server_cache key {:?}", key);
+                                        //debug!("Found server_cache_v4 key {:?}", key);
                                         let mut raw_tls = entry.data.clone().unwrap();
                                         raw_tls.extend_from_slice(&resp_pkt.payload);
                                         match parse_cert(&raw_tls[..]) {
@@ -298,11 +320,11 @@ fn main() {
                                                 debug!("TLS cert found, len: {:?}", cert_chain.len());
 
                                                 debug!("Handling validation cert_len: {:?}", cert_chain.len());
-                                                handle_validation(Arc::clone(&acl_cache), Arc::clone(&client_cache_srv),
+                                                handle_validation(Arc::clone(&acl_cache), Arc::clone(&client_cache_v4_srv),
                                                                   cert_chain.clone(), resp_ip_src, resp_ip_dst, tcp.destination_port);
 
-                                                debug!("Finalizing server_cache entry: {:?}", key);
-                                                server_cache.insert(key.clone(), ServerCacheEntry {
+                                                debug!("Finalizing server_cache_v4 entry: {:?}", key);
+                                                server_cache_v4.insert(key.clone(), ServerCacheEntry {
                                                     ts: SystemTime::now(),
                                                     seq: None,
                                                     data: None,
@@ -314,8 +336,8 @@ fn main() {
                                                 match err {
                                                     CertParseError::IncompleteTlsRecord | CertParseError::WrongTlsRecord => {
                                                         if entry.seq.unwrap() == tcp.sequence_number {
-                                                            debug!("Updating server_cache entry: {:?}", key);
-                                                            server_cache.insert(key.clone(), ServerCacheEntry {
+                                                            debug!("Updating server_cache_v4 entry: {:?}", key);
+                                                            server_cache_v4.insert(key.clone(), ServerCacheEntry {
                                                                 ts: SystemTime::now(),
                                                                 seq: Some(tcp.sequence_number + resp_pkt.payload.len() as u32),
                                                                 data: Some(raw_tls),
@@ -331,17 +353,17 @@ fn main() {
                                         }
                                     }
                                     _ => {
-                                        //debug!("No server_cache key {:?}", key);
+                                        //debug!("No server_cache_v4 key {:?}", key);
                                         match parse_cert(&resp_pkt.payload) {
                                             Ok(cert_chain) => {
                                                 debug!("cert_len: {:?}", cert_chain.len());
 
                                                 debug!("Handling validation cert_len: {:?}", cert_chain.len());
-                                                handle_validation(Arc::clone(&acl_cache), Arc::clone(&client_cache_srv),
+                                                handle_validation(Arc::clone(&acl_cache), Arc::clone(&client_cache_v4_srv),
                                                                   cert_chain.clone(), resp_ip_src, resp_ip_dst, tcp.destination_port);
 
-                                                debug!("Finalizing server_cache entry: {:?}", key);
-                                                server_cache.insert(key.clone(), ServerCacheEntry {
+                                                debug!("Finalizing server_cache_v4 entry: {:?}", key);
+                                                server_cache_v4.insert(key.clone(), ServerCacheEntry {
                                                     ts: SystemTime::now(),
                                                     seq: None,
                                                     data: None,
@@ -352,8 +374,8 @@ fn main() {
                                             Err(err)=> {
                                                 match err {
                                                     CertParseError::IncompleteTlsRecord | CertParseError::WrongTlsRecord => {
-                                                        debug!("Inserting server_cache entry: {:?}", key);
-                                                        server_cache.insert(key, ServerCacheEntry {
+                                                        debug!("Inserting server_cache_v4 entry: {:?}", key);
+                                                        server_cache_v4.insert(key, ServerCacheEntry {
                                                             ts: SystemTime::now(),
                                                             seq: Some(tcp.sequence_number + resp_pkt.payload.len() as u32),
                                                             data: Some(resp_pkt.payload.to_vec()),
