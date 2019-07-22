@@ -20,6 +20,7 @@ use sha2::{Sha256, Sha512, Digest};
 use iptables;
 use x509_parser;
 use simpath::Simpath;
+use ipaddress::{ipv4, ipv6};
 
 // CONSTANTS
 const DNS_TIMEOUT: u64 = 1000; // Timeout for DNS queries in milliseconds, must be divisible by DNS_TIMEOUT_DECREMENT
@@ -32,6 +33,7 @@ const ACL_CACHE_DELAY: u64 = 10; // Sleep this many seconds between acl_cache cl
 const ACL_SHORT_TIMEOUT: u64 = 60; // How many seconds do our short ACLs remain installed?
 const ACL_LONG_TIMEOUT: u64 = 600; // How many seconds do our long ACLs remain installed?
 const IPV6TABLES_DIRS: [&str; 6] = ["/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin"]; // Where we might find ip6tables executable
+
 // Types of errors we can generate from parse_cert()
 #[derive(Debug)]
 enum CertParseError {
@@ -50,7 +52,7 @@ enum SniParseError {
 }
 
 #[derive(Debug, Clone)]
-struct ClientCacheEntry { 
+struct ClientCacheEntry { // Key in hashmap is from derive_cache_key()
     ts: SystemTime, // Last touched timestamp
     sni: String, // SNI
     tlsa: Option<Vec<TLSA>>, // DNS TLSA RRSET
@@ -59,7 +61,7 @@ struct ClientCacheEntry {
 }
 
 #[derive(Debug, Clone)]
-struct ServerCacheEntry { 
+struct ServerCacheEntry { // Key in hashmap is from derive_cache_key()
     ts: SystemTime, // Last touched timestamp
     seq: Option<u32>, // TCP sequence number for reassembly
     data: Option<Vec<u8>>, // TCP fragment for reassembly
@@ -92,9 +94,9 @@ fn main() {
     let mut server_cache_v4: HashMap<String, ServerCacheEntry> = HashMap::new();
 
     if ipv6_enabled() {
-        let client_cache_v6 = Arc::new(RwLock::new(HashMap::<String, ClientCacheEntry>::new()));
-        let client_cache_v6_srv = Arc::clone(&client_cache_v6); // Reference for server_6_thr
-        let mut server_cache_v6: HashMap<String, ServerCacheEntry> = HashMap::new();
+        let _client_cache_v6 = Arc::new(RwLock::new(HashMap::<String, ClientCacheEntry>::new()));
+        let _client_cache_v6_srv = Arc::clone(&_client_cache_v6); // Reference for server_6_thr
+        let mut _server_cache_v6: HashMap<String, ServerCacheEntry> = HashMap::new();
     }
 
     let acl_cache = Arc::new(RwLock::new(HashMap::<String, AclCacheEntry>::new()));
@@ -195,16 +197,15 @@ fn main() {
             let pkt = PacketHeaders::from_ethernet_slice(&packet).expect("Failed to decode packet");
             //debug!("Everything: {:?}", pkt);
 
-            let ip_src: [u8;4];
-            let ip_dst: [u8;4];
             match pkt.ip.unwrap() {
                 Version6(_) => {
                     warn!("IPv6 packet captured when IPv4 expected");
                     continue;
                 }
                 Version4(ref value) => {
-                    ip_src = value.source;
-                    ip_dst = value.destination;
+                    let ip_src = ipv4::new(ipv4_display(&value.source)).unwrap();
+                    let ip_dst = ipv4::new(ipv4_display(&value.destination)).unwrap();
+
                     match pkt.transport.unwrap() {
                         Udp(_) => error!("UDP transport captured when TCP expected"),
                         Tcp(ref value) => {
@@ -214,7 +215,7 @@ fn main() {
                                     let key = derive_cache_key(&ip_src, &ip_dst, &value.source_port);
                                     debug!("Inserting client_cache_v4 entry: {:?} sni: {:?}", key, sni);
                                     client_cache_v4.write().insert(
-                                        derive_cache_key(&ip_src, &ip_dst, &value.source_port),
+                                        derive_cache_key(&ip_src, &ip_dst, &value.source_port), // TODO: don't recompute cache key
                                         ClientCacheEntry {
                                             ts: SystemTime::now(),
                                             sni: sni.clone(),
@@ -274,8 +275,6 @@ fn main() {
             if resp_packet.len() <= 60 {
                 continue;
             }
-            let resp_ip_src: [u8;4];
-            let resp_ip_dst: [u8;4];
 
             match resp_pkt.ip.unwrap() {
                 Version6(_) => {
@@ -283,8 +282,9 @@ fn main() {
                     continue;
                 }
                 Version4(ref value) => {
-                    resp_ip_src = value.source;
-                    resp_ip_dst = value.destination;
+                    let resp_ip_src = ipv4::new(ipv4_display(&value.source)).unwrap();
+                    let resp_ip_dst = ipv4::new(ipv4_display(&value.destination)).unwrap();
+
                     match resp_pkt.transport.unwrap() {
                         Udp(_) => warn!("UDP transport captured when TCP expected"),
                         Tcp(ref tcp) => {
@@ -479,7 +479,7 @@ fn dns_lookup_tlsa(client_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>,
 // Determines validation disposition and installs ACLs if necessary
 fn handle_validation(acl_cache: Arc<RwLock<HashMap<String, AclCacheEntry>>>,
                      cl_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>,
-                     cert_chain: Vec<Vec<u8>>, src: [u8;4], dst: [u8;4], port: u16) {
+                     cert_chain: Vec<Vec<u8>>, src: ipaddress::IPAddress, dst: ipaddress::IPAddress, port: u16) {
 
     debug!("Entered handle_validation {:?} {:?} {:?}", src, dst, port);
 
@@ -502,10 +502,10 @@ fn handle_validation(acl_cache: Arc<RwLock<HashMap<String, AclCacheEntry>>>,
                                     match ipt_add_chain(&ipt, &chain) { 
                                         Err(err) => panic!("Fatal iptables error at add_chain {:?}", err),
                                         Ok(_) => {
-                                            match ipt_add_v4_short(&ipt, &chain, ipv4_display(&src), ipv4_display(&dst), port) {
+                                            match ipt_add_v4_short(&ipt, &chain, src.to_s(), dst.to_s(), port) {
                                                 Err(err) => panic!("Fatal iptables error at add_short {:?}", err),
                                                 Ok(_) => {
-                                                    match ipt_add_v4_long(&ipt, &chain, &sni) {
+                                                    match ipt_add_long(&ipt, &chain, &sni) {
                                                         Err(err) => panic!("Fatal iptables error at add_long {:?}", err),
                                                         Ok(_) => {
                                                             debug!("Inserting new acl_cache entry {:?}", chain);
@@ -609,16 +609,11 @@ fn ipt_add_v4_short(ipt: &iptables::IPTables, chain: &String, src: String, dst: 
 }
 
 // Add long term egress ACL to a chain
-fn ipt_add_v4_long(ipt: &iptables::IPTables, chain: &String, sni: &String) -> Result<(), iptables::error::IPTError> {
+fn ipt_add_long(ipt: &iptables::IPTables, chain: &String, sni: &String) -> Result<(), iptables::error::IPTError> {
     let long_egress =  format!("{}{}{}", "-p tcp --dport 443 -m string --algo bm --string ", &sni, " -j DROP");
     debug!("long_egress: {:?}", long_egress);
     ipt.insert_unique("filter", &chain, &long_egress, 1)?;
     return Ok(());
-}
-
-// Returns display formatted string for ipv4 address
-fn ipv4_display(ip: &[u8;4]) -> String {
-    return ip.iter().map(|x| format!(".{}", x)).collect::<String>().split_off(1);
 }
 
 // Validates X.509 cert against TLSA 
@@ -789,19 +784,19 @@ fn parse_sni(payload: &[u8]) -> Result<String, SniParseError> {
 
 // Derives a cache key from unique pairing of values
 // Source and destination are from perspective of TLS CLIENTHELLO
-fn derive_cache_key(src: &[u8;4], dst: &[u8;4], port: &u16) -> String {
+fn derive_cache_key(src: &ipaddress::IPAddress, dst: &ipaddress::IPAddress, port: &u16) -> String {
     let delim = "_".to_string();
-    let mut key = "".to_string();
-    for n in src.iter() {
-        key.push_str(&n.to_string());
-        key.push_str(&delim);
-    }
-    for n in dst.iter() {
-        key.push_str(&n.to_string());
-        key.push_str(&delim);
-    }
+    let mut key = src.to_s();
+    key.push_str(&delim);
+    key.push_str(&dst.to_s());
+    key.push_str(&delim);
     key.push_str(&port.to_string());
     key
+}
+
+// Returns display formatted string for ipv4 address
+fn ipv4_display(ip: &[u8;4]) -> String {
+    return ip.iter().map(|x| format!(".{}", x)).collect::<String>().split_off(1);
 }
 
 // Is this machine IPv6 capable?
