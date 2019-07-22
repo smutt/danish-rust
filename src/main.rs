@@ -214,8 +214,7 @@ fn main() {
                                 Ok(sni) => {
                                     let key = derive_cache_key(&ip_src, &ip_dst, &value.source_port);
                                     debug!("Inserting client_cache_v4 entry: {:?} sni: {:?}", key, sni);
-                                    client_cache_v4.write().insert(
-                                        derive_cache_key(&ip_src, &ip_dst, &value.source_port), // TODO: don't recompute cache key
+                                    client_cache_v4.write().insert(key.clone(),
                                         ClientCacheEntry {
                                             ts: SystemTime::now(),
                                             sni: sni.clone(),
