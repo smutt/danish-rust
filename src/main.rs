@@ -263,10 +263,6 @@ fn main() {
             }
             drop(stale);
 
-            let resp_pkt = PacketHeaders::from_ethernet_slice(&resp_packet)
-                .expect("Failed to decode resp_packet");
-            //debug!("Everything: {:?}", resp_pkt);
-
             /* pcap/Etherparse strips the Ethernet FCS before it hands the packet to us.
             So a 60 byte packet was 64 bytes on the wire.
             Etherparse interprets any Ethernet padding as TCP data. I consider this a bug.
@@ -276,21 +272,25 @@ fn main() {
                 continue;
             }
 
-            match resp_pkt.ip.unwrap() {
+            let pkt = PacketHeaders::from_ethernet_slice(&resp_packet)
+                .expect("Failed to decode resp_packet");
+            //debug!("Everything: {:?}", pkt);
+
+            match pkt.ip.unwrap() {
                 Version6(_) => {
                     warn!("IPv6 packet captured, but IPv4 expected");
                     continue;
                 }
                 Version4(ref value) => {
-                    let resp_ip_src = ipv4::new(ipv4_display(&value.source)).unwrap();
-                    let resp_ip_dst = ipv4::new(ipv4_display(&value.destination)).unwrap();
+                    let ip_src = ipv4::new(ipv4_display(&value.source)).unwrap();
+                    let ip_dst = ipv4::new(ipv4_display(&value.destination)).unwrap();
 
-                    match resp_pkt.transport.unwrap() {
+                    match pkt.transport.unwrap() {
                         Udp(_) => warn!("UDP transport captured when TCP expected"),
                         Tcp(ref tcp) => {
                             //debug!("resp_tcp_seq: {:?}", tcp.sequence_number);
-                            //debug!("payload_len: {:?}", resp_pkt.payload.len());
-                            let key = derive_cache_key(&resp_ip_dst, &resp_ip_src, &tcp.destination_port);
+                            //debug!("payload_len: {:?}", pkt.payload.len());
+                            let key = derive_cache_key(&ip_dst, &ip_src, &tcp.destination_port);
                             if client_cache_v4_srv.read().contains_key(&key) {
                                 //debug!("Found client_cache key {:?}", key);
 
@@ -308,14 +308,14 @@ fn main() {
 
                                         //debug!("Found server_cache_v4 key {:?}", key);
                                         let mut raw_tls = entry.data.clone().unwrap();
-                                        raw_tls.extend_from_slice(&resp_pkt.payload);
+                                        raw_tls.extend_from_slice(&pkt.payload);
                                         match parse_cert(&raw_tls[..]) {
                                             Ok(cert_chain) => {
                                                 debug!("TLS cert found, len: {:?}", cert_chain.len());
 
                                                 debug!("Handling validation cert_len: {:?}", cert_chain.len());
                                                 handle_validation(Arc::clone(&acl_cache), Arc::clone(&client_cache_v4_srv),
-                                                                  cert_chain.clone(), resp_ip_src, resp_ip_dst, tcp.destination_port);
+                                                                  cert_chain.clone(), ip_src, ip_dst, tcp.destination_port);
 
                                                 debug!("Finalizing server_cache_v4 entry: {:?}", key);
                                                 server_cache_v4.insert(key.clone(), ServerCacheEntry {
@@ -333,7 +333,7 @@ fn main() {
                                                             debug!("Updating server_cache_v4 entry: {:?}", key);
                                                             server_cache_v4.insert(key.clone(), ServerCacheEntry {
                                                                 ts: SystemTime::now(),
-                                                                seq: Some(tcp.sequence_number + resp_pkt.payload.len() as u32),
+                                                                seq: Some(tcp.sequence_number + pkt.payload.len() as u32),
                                                                 data: Some(raw_tls),
                                                                 cert_chain: None,
                                                                 stale: false,
@@ -348,13 +348,13 @@ fn main() {
                                     }
                                     _ => {
                                         //debug!("No server_cache_v4 key {:?}", key);
-                                        match parse_cert(&resp_pkt.payload) {
+                                        match parse_cert(&pkt.payload) {
                                             Ok(cert_chain) => {
                                                 debug!("cert_len: {:?}", cert_chain.len());
 
                                                 debug!("Handling validation cert_len: {:?}", cert_chain.len());
                                                 handle_validation(Arc::clone(&acl_cache), Arc::clone(&client_cache_v4_srv),
-                                                                  cert_chain.clone(), resp_ip_src, resp_ip_dst, tcp.destination_port);
+                                                                  cert_chain.clone(), ip_src, ip_dst, tcp.destination_port);
 
                                                 debug!("Finalizing server_cache_v4 entry: {:?}", key);
                                                 server_cache_v4.insert(key.clone(), ServerCacheEntry {
@@ -371,8 +371,8 @@ fn main() {
                                                         debug!("Inserting server_cache_v4 entry: {:?}", key);
                                                         server_cache_v4.insert(key, ServerCacheEntry {
                                                             ts: SystemTime::now(),
-                                                            seq: Some(tcp.sequence_number + resp_pkt.payload.len() as u32),
-                                                            data: Some(resp_pkt.payload.to_vec()),
+                                                            seq: Some(tcp.sequence_number + pkt.payload.len() as u32),
+                                                            data: Some(pkt.payload.to_vec()),
                                                             cert_chain: None,
                                                             stale: false,
                                                         });
