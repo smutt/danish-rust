@@ -7,16 +7,16 @@ edition = "2018"
 [dependencies]
 pcap = { version = "0.7", features = ["tokio"] }
 ctrlc = { version = "3.0", features = ["termination"] }
-etherparse = { version = "0.8.0" }
-iptables = { version = "0.2" }
-tls-parser = { version = "0.7.0" }
-nom = { version = "^4.1" }
-log = "0.4.0"
-env_logger = "0.6.1"
-parking_lot = "0.8.0"
+etherparse = "^0.8.2"
+iptables = "^0.2.2"
+tls-parser = "0.7.*"
+nom = "^4.1"
+log = "^0.4.0"
+env_logger = "^0.6.1"
+parking_lot = "^0.8.0"
 sha2 = "0.8.0"
-rand = "0.7"
-x509-parser = "^0.4.3"
+rand = "^0.7.0"
+x509-parser = "^0.5.1"
 resolv = { git = "https://github.com/smutt/resolv-rs" }
-simpath = "1.3.0"
-ipaddress = "0.1.2"
+simpath = "^1.3.0"
+ipaddress = "^0.1.2"
