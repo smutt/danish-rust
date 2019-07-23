@@ -75,6 +75,7 @@ struct AclCacheEntry { // Key in hashmap is iptables chain name
     insert_ts: SystemTime, // When were these ACLs inserted? None if not yet inserted.
     sni: String, // SNI
     short_active: bool, // Is the short term ACL active?
+    short_ipv4: bool, // Is the short term ACL IPv4 or IPv6?
 }
 
 fn main() {
@@ -140,14 +141,38 @@ fn main() {
                 }
             }
 
+            // Delete ip6tables entries first if enabled
+            // Don't remove acl_cache entries or stale Vectors until iptables entries are deleted
             if short_stale.len() > 0 || long_stale.len() > 0 {
+                if ipv6_enabled() {
+                    match iptables::new(true) {
+                        Err(_) => panic!("FATAL ip6tables error"),
+                        Ok(ipt6) => {
+                            for key in short_stale.iter() {
+                                if let Some(entry) = acl_cache_clean.read().get(key) {
+                                    if !entry.short_ipv4 {
+                                        ipt_del_short(&ipt6, &key).expect("FATAL ip6tables error");
+                                    }
+                                }else{
+                                    panic!("Failed to read acl_cache");
+                                }
+                            }
+                            for key in long_stale.iter() {
+                                ipt_del_long(&ipt6, &key).expect("FATAL ip6tables error");
+                                ipt_del_chain(&ipt6, &key).expect("FATAL ip6tables error");
+                                debug!("Deleted stale acl_cache entry {:?}", key);
+                            }
+                        }
+                    }
+                }
                 match iptables::new(false) {
                     Err(_) => panic!("FATAL iptables error"),
                     Ok(ipt) => {
-                        debug!("Created ipt obj");
                         for key in short_stale.iter() {
-                            ipt_del_short(&ipt, &key).expect("FATAL iptables error");
                             if let Some(entry) = acl_cache_clean.write().get_mut(key) {
+                                if entry.short_ipv4 {
+                                    ipt_del_short(&ipt, &key).expect("FATAL iptables error");
+                                }
                                 entry.short_active = false;
                                 entry.ts = SystemTime::now();
                             }else{
@@ -209,7 +234,7 @@ fn main() {
                     match pkt.transport.unwrap() {
                         Udp(_) => error!("UDP transport captured when TCP expected"),
                         Tcp(ref value) => {
-                            match parse_sni(pkt.payload) { // We can assume SNI comes in one packet
+                            match parse_sni(pkt.payload) { // Let's assume SNI comes in one packet
                                 Err(_) => error!("Error parsing SNI"),
                                 Ok(sni) => {
                                     let key = derive_cache_key(&ip_src, &ip_dst, &value.source_port);
@@ -495,34 +520,37 @@ fn handle_validation(acl_cache: Arc<RwLock<HashMap<String, AclCacheEntry>>>,
                         }else{
                             debug!("Invalid TLSA for {:?}", sni);
                             let chain = unique_chain_name(&sni);
-                            match iptables::new(false) { // Create iptables chains, insert ACLs and create acl_cache entry
+                            match iptables::new(false) { // Create iptables chains and insert ACLs
                                 Err(err) => panic!("Fatal iptables error {:?}", err),
                                 Ok(ipt) => {
-                                    match ipt_add_chain(&ipt, &chain) { 
-                                        Err(err) => panic!("Fatal iptables error at add_chain {:?}", err),
-                                        Ok(_) => {
-                                            match ipt_add_v4_short(&ipt, &chain, src.to_s(), dst.to_s(), port) {
-                                                Err(err) => panic!("Fatal iptables error at add_short {:?}", err),
-                                                Ok(_) => {
-                                                    match ipt_add_long(&ipt, &chain, &sni) {
-                                                        Err(err) => panic!("Fatal iptables error at add_long {:?}", err),
-                                                        Ok(_) => {
-                                                            debug!("Inserting new acl_cache entry {:?}", chain);
-                                                            acl_cache.write().insert(chain, AclCacheEntry {
-                                                                ts: SystemTime::now(),
-                                                                insert_ts: SystemTime::now(),
-                                                                sni: sni.clone(),
-                                                                short_active: true,
-                                                            });
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
+                                    ipt_add_chain(&ipt, &chain).expect("Fatal iptables error at add_chain");
+                                    if src.is_ipv4() {
+                                        ipt_add_short(&ipt, &chain, &src, &dst, port).expect("Fatal iptables error at add_short");
                                     }
-                                    break;
+                                    ipt_add_long(&ipt, &chain, &sni).expect("Fatal iptables error at add_long");
                                 }
                             }
+                            if ipv6_enabled() {
+                                match iptables::new(true) { // Create ip6tables chains and insert ACLs
+                                    Err(err) => panic!("Fatal ip6tables error {:?}", err),
+                                    Ok(ipt6) => {
+                                        ipt_add_chain(&ipt6, &chain).expect("Fatal ip6tables error at add_chain");
+                                        if src.is_ipv6() {
+                                            ipt_add_short(&ipt6, &chain, &src, &dst, port).expect("Fatal ip6tables error at add_short");
+                                        }
+                                        ipt_add_long(&ipt6, &chain, &sni).expect("Fatal ip6tables error at add_long");
+                                    }
+                                }
+                            }
+
+                            debug!("Inserting new acl_cache entry {:?}", chain);
+                            acl_cache.write().insert(chain, AclCacheEntry {
+                                ts: SystemTime::now(),
+                                insert_ts: SystemTime::now(),
+                                sni: sni.clone(),
+                                short_active: true,
+                                short_ipv4: src.is_ipv4(),
+                            });
                         }
                         break;
                     }
@@ -560,6 +588,32 @@ fn ipt_add_chain(ipt: &iptables::IPTables, chain: &String) -> Result<(), iptable
     return Ok(());
 }
 
+// Adds short term ingress and egress ACLs to a chain
+fn ipt_add_short(ipt: &iptables::IPTables, chain: &String, src: &ipaddress::IPAddress,
+                 dst: &ipaddress::IPAddress, port: u16) -> Result<(), iptables::error::IPTError> {
+
+    let short_ingress = format!("{}{}{}{}{}{}{}{}{}", "--destination ", &dst.to_string(), " ",
+                                "--source ", &src.to_string(), " ",
+                                "-p tcp --sport 443 --dport ", format!("{}", port), " -j DROP");
+    ipt.insert_unique("filter", &chain, &short_ingress, 1)?;
+    debug!("Inserted short_ingress: {:?}", short_ingress);
+
+    let short_egress = format!("{}{}{}{}{}{}{}{}{}", "--destination ", &src.to_string(), " ",
+                               "--source ", &dst.to_string(), " ",
+                               "-p tcp --dport 443 --sport ", format!("{}", port), " -j DROP");
+    ipt.insert_unique("filter", &chain, &short_egress, 1)?;
+    debug!("Inserted short_egress: {:?}", short_egress);
+    return Ok(());
+}
+
+// Add long term egress ACL to a chain
+fn ipt_add_long(ipt: &iptables::IPTables, chain: &String, sni: &String) -> Result<(), iptables::error::IPTError> {
+    let long_egress =  format!("{}{}{}", "-p tcp --dport 443 -m string --algo bm --string ", &sni, " -j DROP");
+    debug!("long_egress: {:?}", long_egress);
+    ipt.insert_unique("filter", &chain, &long_egress, 1)?;
+    return Ok(());
+}
+
 // Delinks then deletes an existing iptables chain
 fn ipt_del_chain(ipt: &iptables::IPTables, chain: &String) -> Result<(), iptables::error::IPTError> {
     debug!("Deleting chain {:?}", chain);
@@ -588,30 +642,6 @@ fn ipt_del_long(ipt: &iptables::IPTables, chain: &String) -> Result<(), iptables
             ipt.delete("filter", &chain, &acl.replace(&format!("{}{}", "-A ", &chain), ""))?;
         }
     }
-    return Ok(());
-}
-
-// Adds short term ingress and egress ACLs to a chain
-fn ipt_add_v4_short(ipt: &iptables::IPTables, chain: &String, src: String, dst: String, port: u16) -> Result<(), iptables::error::IPTError> {
-    let short_ingress = format!("{}{}{}{}{}{}{}{}{}", "--destination ", &dst, "/32 ",
-                                "--source ", &src, "/32 ",
-                                "-p tcp --sport 443 --dport ", format!("{}", port), " -j DROP");
-    ipt.insert_unique("filter", &chain, &short_ingress, 1)?;
-    debug!("Inserted short_ingress: {:?}", short_ingress);
-
-    let short_egress = format!("{}{}{}{}{}{}{}{}{}", "--destination ", &src, "/32 ",
-                               "--source ", &dst, "/32 ",
-                               "-p tcp --dport 443 --sport ", format!("{}", port), " -j DROP");
-    ipt.insert_unique("filter", &chain, &short_egress, 1)?;
-    debug!("Inserted short_egress: {:?}", short_egress);
-    return Ok(());
-}
-
-// Add long term egress ACL to a chain
-fn ipt_add_long(ipt: &iptables::IPTables, chain: &String, sni: &String) -> Result<(), iptables::error::IPTError> {
-    let long_egress =  format!("{}{}{}", "-p tcp --dport 443 -m string --algo bm --string ", &sni, " -j DROP");
-    debug!("long_egress: {:?}", long_egress);
-    ipt.insert_unique("filter", &chain, &long_egress, 1)?;
     return Ok(());
 }
 
