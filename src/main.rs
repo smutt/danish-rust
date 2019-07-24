@@ -93,13 +93,10 @@ fn main() {
     let client_cache_v4 = Arc::new(RwLock::new(HashMap::<String, ClientCacheEntry>::new()));
     let client_cache_v4_srv = Arc::clone(&client_cache_v4); // Reference for server_4_thr
     let server_cache_v4 = Arc::new(RwLock::new(HashMap::<String, ServerCacheEntry>::new()));
-    //: HashMap<String, ServerCacheEntry> = HashMap::new();
 
-    if ipv6_enabled() {
-        let _client_cache_v6 = Arc::new(RwLock::new(HashMap::<String, ClientCacheEntry>::new()));
-        let _client_cache_v6_srv = Arc::clone(&_client_cache_v6); // Reference for server_6_thr
-        let mut _server_cache_v6: HashMap<String, ServerCacheEntry> = HashMap::new();
-    }
+    let client_cache_v6 = Arc::new(RwLock::new(HashMap::<String, ClientCacheEntry>::new()));
+    let client_cache_v6_srv = Arc::clone(&client_cache_v6); // Reference for server_6_thr
+    let server_cache_v6 = Arc::new(RwLock::new(HashMap::<String, ServerCacheEntry>::new()));
 
     let acl_cache = Arc::new(RwLock::new(HashMap::<String, AclCacheEntry>::new()));
     let acl_cache_clean = Arc::clone(&acl_cache); // Reference for acl_clean_thr
@@ -247,7 +244,6 @@ fn main() {
                                             response: false,
                                             stale: false,
                                         });
-                                    // Lookup TLSA record and record response in client_cache_v4 entry
                                     dns_lookup_tlsa(Arc::clone(&client_cache_v4), key.clone());
                                 }
                             }
@@ -258,6 +254,73 @@ fn main() {
         }
     });
     threads.push(client_4_thr);
+
+    if ipv6_enabled() {
+        let client_6_thr = thread::spawn(move || {
+            let bpf_client_6 = "ip6 and tcp and dst port 443";
+            let mut capture = Device::lookup().unwrap().open().unwrap();
+            match capture.filter(bpf_client_6){
+                Ok(_) => (),
+                Err(err) => error!("BPF error {}", err.to_string()),
+            }
+
+            while let Ok(packet) = capture.next() {
+                debug!("Investigating client_cache_v6 staleness {:?}", client_cache_v6.read().len());
+                let mut stale = Vec::new();
+                for (key,entry) in client_cache_v6.read().iter() {
+                    if entry.stale {
+                        if entry.ts < SystemTime::now() - Duration::new(CACHE_MIN_STALENESS, 0) {
+                            stale.push(key.clone());
+                            debug!("Found stale client_cache_v6 entry {:?}", key);
+                        }
+                    }
+                }
+                for key in stale.iter() {
+                    client_cache_v6.write().remove(key);
+                    debug!("Deleted stale client_cache_v6 entry {:?}", key);
+                }
+                drop(stale);
+
+                let pkt = PacketHeaders::from_ethernet_slice(&packet).expect("Failed to decode packet");
+                //debug!("Everything: {:?}", pkt);
+
+                match pkt.ip.unwrap() {
+                    Version4(_) => {
+                        warn!("IPv4 packet captured when IPv6 expected");
+                        continue;
+                    }
+                    Version6(ref value) => {
+                        if pkt.payload.len() > 0 && pkt.payload[1] == 22 {
+                            let ip_src = ipv6::new(ipv6_display(&value.source)).unwrap();
+                            let ip_dst = ipv6::new(ipv6_display(&value.destination)).unwrap();
+
+                            match pkt.transport.unwrap() {
+                                Udp(_) => error!("UDP transport captured when TCP expected"),
+                                Tcp(ref value) => {
+                                    match parse_sni(pkt.payload) { // Let's assume SNI comes in one packet
+                                        Err(_) => error!("Error parsing SNI"),
+                                        Ok(sni) => {
+                                            let key = derive_cache_key(&ip_src, &ip_dst, &value.source_port);
+                                            debug!("Inserting client_cache_v6 entry: {:?} sni: {:?}", key, sni);
+                                            client_cache_v6.write().insert(key.clone(), ClientCacheEntry {
+                                                ts: SystemTime::now(),
+                                                sni: sni.clone(),
+                                                tlsa: None,
+                                                response: false,
+                                                stale: false,
+                                            });
+                                            dns_lookup_tlsa(Arc::clone(&client_cache_v6), key.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        threads.push(client_6_thr);
+    }
 
     let server_4_thr = thread::spawn(move || {
         // ACK == 1 && RST == 0 && SYN == 0 && FIN == 0 && must accept TCP fragments
@@ -838,6 +901,18 @@ fn derive_cache_key(src: &ipaddress::IPAddress, dst: &ipaddress::IPAddress, port
 // Returns display formatted string for ipv4 address
 fn ipv4_display(ip: &[u8;4]) -> String {
     return ip.iter().map(|x| format!(".{}", x)).collect::<String>().split_off(1);
+}
+
+// Returns display formatted string for ipv6 address
+fn ipv6_display(ip: &[u8;16]) -> String {
+    let mut rv = "".to_string();
+    for ii in 0..15 {
+        rv.push_str(&ip[ii].to_string());
+        if ii % 2 == 0 {
+            rv.push_str(":");
+        }
+    }
+    rv
 }
 
 // Is this machine IPv6 capable?
