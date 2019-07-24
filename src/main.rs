@@ -65,7 +65,7 @@ struct ServerCacheEntry { // Key in hashmap is from derive_cache_key()
     ts: SystemTime, // Last touched timestamp
     seq: Option<u32>, // TCP sequence number for reassembly
     data: Option<Vec<u8>>, // TCP fragment for reassembly
-    cert_chain: Option<Vec<Vec<u8>>>, // DER-encoded X.509 certificates
+    //cert_chain: Option<Vec<Vec<u8>>>, // DER-encoded X.509 certificates
     stale: bool, // Entry can be deleted at next cleanup
 }
 
@@ -92,7 +92,8 @@ fn main() {
     // TODO: We may get better cache entry atomicity if we use crate chashmap
     let client_cache_v4 = Arc::new(RwLock::new(HashMap::<String, ClientCacheEntry>::new()));
     let client_cache_v4_srv = Arc::clone(&client_cache_v4); // Reference for server_4_thr
-    let mut server_cache_v4: HashMap<String, ServerCacheEntry> = HashMap::new();
+    let server_cache_v4 = Arc::new(RwLock::new(HashMap::<String, ServerCacheEntry>::new()));
+    //: HashMap<String, ServerCacheEntry> = HashMap::new();
 
     if ipv6_enabled() {
         let _client_cache_v6 = Arc::new(RwLock::new(HashMap::<String, ClientCacheEntry>::new()));
@@ -193,16 +194,15 @@ fn main() {
     threads.push(acl_clean_thr);
 
     let client_4_thr = thread::spawn(move || {
-        // Setup pcap listen
         // ACK == 1 && RST == 0 && SYN == 0 && FIN == 0 && must accept TCP fragments
         let bpf_client_4 = "(tcp[((tcp[12:1] & 0xf0) >> 2)+5:1] = 0x01) and (tcp[((tcp[12:1] & 0xf0) >> 2):1] = 0x16) and (dst port 443)";
-        let mut client_cap = Device::lookup().unwrap().open().unwrap();
-        match client_cap.filter(bpf_client_4){
+        let mut capture = Device::lookup().unwrap().open().unwrap();
+        match capture.filter(bpf_client_4){
             Ok(_) => (),
             Err(err) => error!("BPF error {}", err.to_string()),
         }
 
-        while let Ok(packet) = client_cap.next() {
+        while let Ok(packet) = capture.next() {
             debug!("Investigating client_cache_v4 staleness {:?}", client_cache_v4.read().len());
             let mut stale = Vec::new();
             for (key,entry) in client_cache_v4.read().iter() {
@@ -264,16 +264,16 @@ fn main() {
         let bpf_server_4 = "tcp and src port 443 and (tcp[tcpflags] & tcp-ack = 16) and (tcp[tcpflags] & tcp-syn != 2) and 
         (tcp[tcpflags] & tcp-fin != 1) and (tcp[tcpflags] & tcp-rst != 1)";
 
-        let mut server_cap = Device::lookup().unwrap().open().unwrap();
-        match server_cap.filter(bpf_server_4){
+        let mut capture = Device::lookup().unwrap().open().unwrap();
+        match capture.filter(bpf_server_4){
             Ok(_) => (),
             Err(err) => error!("BPF error {}", err.to_string()),
         }
 
-        while let Ok(resp_packet) = server_cap.next() {
-            debug!("Investigating server_cache_v4 staleness {:?}", server_cache_v4.len());
+        while let Ok(resp_packet) = capture.next() {
+            debug!("Investigating server_cache_v4 staleness {:?}", server_cache_v4.read().len());
             let mut stale = Vec::new();
-            for (key,entry) in server_cache_v4.iter() {
+            for (key,entry) in server_cache_v4.read().iter() {
                 if entry.stale {
                     if entry.ts < SystemTime::now() - Duration::new(CACHE_MIN_STALENESS, 0) {
                         stale.push(key.clone());
@@ -282,7 +282,7 @@ fn main() {
                 }
             }
             for key in stale.iter() {
-                server_cache_v4.remove(key);
+                server_cache_v4.write().remove(key);
                 debug!("Deleted stale server_cache_v4 entry {:?}", key);
             }
             drop(stale);
@@ -306,107 +306,15 @@ fn main() {
                     continue;
                 }
                 Version4(ref value) => {
-                    let ip_src = ipv4::new(ipv4_display(&value.source)).unwrap();
-                    let ip_dst = ipv4::new(ipv4_display(&value.destination)).unwrap();
-
                     match pkt.transport.unwrap() {
                         Udp(_) => warn!("UDP transport captured when TCP expected"),
-                        Tcp(ref tcp) => {
+                        Tcp(tcp) => {
                             //debug!("resp_tcp_seq: {:?}", tcp.sequence_number);
                             //debug!("payload_len: {:?}", pkt.payload.len());
-                            let key = derive_cache_key(&ip_dst, &ip_src, &tcp.destination_port);
-                            if client_cache_v4_srv.read().contains_key(&key) {
-                                //debug!("Found client_cache key {:?}", key);
-
-                                /* The Certificate TLS message may not be the first TLS message we receive.
-                                It will also likely span multiple TCP packets. Thus we need to test every payload
-                                received to see if it is complete, if not we need to store it until we get the
-                                next segment and test completeness again. If it is complete, but still not a
-                                Certificate TLS message we need to flush cache and start waiting again. */
-                                match server_cache_v4.get(&key) {
-                                    Some(ref entry) => {
-                                        if entry.cert_chain.is_some() {
-                                            //debug!("Ignoring server_cache_v4 key {:?}", key);
-                                            continue;
-                                        }
-
-                                        //debug!("Found server_cache_v4 key {:?}", key);
-                                        let mut raw_tls = entry.data.clone().unwrap();
-                                        raw_tls.extend_from_slice(&pkt.payload);
-                                        match parse_cert(&raw_tls[..]) {
-                                            Ok(cert_chain) => {
-                                                debug!("TLS cert found, len: {:?}", cert_chain.len());
-
-                                                debug!("Handling validation cert_len: {:?}", cert_chain.len());
-                                                handle_validation(Arc::clone(&acl_cache), Arc::clone(&client_cache_v4_srv),
-                                                                  cert_chain.clone(), ip_src, ip_dst, tcp.destination_port);
-
-                                                debug!("Finalizing server_cache_v4 entry: {:?}", key);
-                                                server_cache_v4.insert(key.clone(), ServerCacheEntry {
-                                                    ts: SystemTime::now(),
-                                                    seq: None,
-                                                    data: None,
-                                                    cert_chain: Some(cert_chain.clone()),
-                                                    stale: true,
-                                                });
-                                            }
-                                            Err(err) => {
-                                                match err {
-                                                    CertParseError::IncompleteTlsRecord | CertParseError::WrongTlsRecord => {
-                                                        if entry.seq.unwrap() == tcp.sequence_number {
-                                                            debug!("Updating server_cache_v4 entry: {:?}", key);
-                                                            server_cache_v4.insert(key.clone(), ServerCacheEntry {
-                                                                ts: SystemTime::now(),
-                                                                seq: Some(tcp.sequence_number + pkt.payload.len() as u32),
-                                                                data: Some(raw_tls),
-                                                                cert_chain: None,
-                                                                stale: false,
-                                                            });
-                                                        }else{
-                                                            debug!("Out-of-order TCP datagrams detected"); // TODO: This error doesn't tell the whole story
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        //debug!("No server_cache_v4 key {:?}", key);
-                                        match parse_cert(&pkt.payload) {
-                                            Ok(cert_chain) => {
-                                                debug!("cert_len: {:?}", cert_chain.len());
-
-                                                debug!("Handling validation cert_len: {:?}", cert_chain.len());
-                                                handle_validation(Arc::clone(&acl_cache), Arc::clone(&client_cache_v4_srv),
-                                                                  cert_chain.clone(), ip_src, ip_dst, tcp.destination_port);
-
-                                                debug!("Finalizing server_cache_v4 entry: {:?}", key);
-                                                server_cache_v4.insert(key.clone(), ServerCacheEntry {
-                                                    ts: SystemTime::now(),
-                                                    seq: None,
-                                                    data: None,
-                                                    cert_chain: Some(cert_chain.clone()),
-                                                    stale: true,
-                                                });
-                                            }
-                                            Err(err)=> {
-                                                match err {
-                                                    CertParseError::IncompleteTlsRecord | CertParseError::WrongTlsRecord => {
-                                                        debug!("Inserting server_cache_v4 entry: {:?}", key);
-                                                        server_cache_v4.insert(key, ServerCacheEntry {
-                                                            ts: SystemTime::now(),
-                                                            seq: Some(tcp.sequence_number + pkt.payload.len() as u32),
-                                                            data: Some(pkt.payload.to_vec()),
-                                                            cert_chain: None,
-                                                            stale: false,
-                                                        });
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            parse_server_hello(&acl_cache, &client_cache_v4_srv, &server_cache_v4,
+                                               ipv4::new(ipv4_display(&value.source)).unwrap(),
+                                               ipv4::new(ipv4_display(&value.destination)).unwrap(),
+                                               tcp, pkt.payload);
                         }
                     }
                 }
@@ -420,6 +328,110 @@ fn main() {
     }
 
     debug!("Finish");
+}
+
+// Parse TLS server hello for both IPv4 and IPv6
+fn parse_server_hello(acl_cache: &Arc<RwLock<HashMap::<String, AclCacheEntry>>>,
+                      client_cache: &Arc<RwLock<HashMap<String, ClientCacheEntry>>>,
+                      server_cache: &Arc<RwLock<HashMap<String, ServerCacheEntry>>>,
+                      ip_src: ipaddress::IPAddress, ip_dst: ipaddress::IPAddress,
+                      tcp_header: etherparse::TcpHeader, payload: &[u8]) {
+
+    let key = derive_cache_key(&ip_dst, &ip_src, &tcp_header.destination_port);
+    let client_seen = client_cache.read().contains_key(&key);
+    if client_seen {
+        //debug!("Found client_cache key {:?}", key);
+
+        /* The Certificate TLS message may not be the first TLS message we receive.
+        It will also likely span multiple TCP packets. Thus we need to test every payload
+        received to see if it is complete, if not we need to store it until we get the
+        next segment and test completeness again. If it is complete, but still not a
+        Certificate TLS message we need to flush cache and start waiting again. */
+
+        let server_seen = server_cache.read().contains_key(&key);
+        if server_seen {
+            if let Some(entry) = server_cache.write().get_mut(&key) {
+                if entry.stale {
+                    //debug!("Ignoring server_cache key {:?}", key);
+                    return
+                }
+
+                //debug!("Found server_cache key {:?}", key);
+                let mut raw_tls = entry.data.clone().unwrap();
+                raw_tls.extend_from_slice(&payload);
+                match parse_cert(&raw_tls[..]) {
+                    Ok(cert_chain) => {
+                        debug!("TLS cert found, len: {:?}", cert_chain.len());
+
+                        debug!("Handling validation cert_len: {:?}", cert_chain.len());
+                        handle_validation(Arc::clone(&acl_cache), Arc::clone(&client_cache),
+                                          cert_chain.clone(), ip_src, ip_dst, tcp_header.destination_port);
+
+                        debug!("Finalizing server_cache entry: {:?}", key);
+                        entry.ts = SystemTime::now();
+                        entry.seq = None;
+                        entry.data = None;
+                        //entry.cert_chain = Some(cert_chain.clone());
+                        entry.stale = true;
+                    }
+                    Err(err) => {
+                        match err { // TODO: Why check errors if they all result in the same action
+                            CertParseError::IncompleteTlsRecord | CertParseError::WrongTlsRecord => {
+                                if entry.seq.unwrap() == tcp_header.sequence_number {
+                                    debug!("Updating server_cache entry: {:?}", key);
+                                    entry.ts = SystemTime::now();
+                                    entry.seq = Some(tcp_header.sequence_number + payload.len() as u32);
+                                    entry.data = Some(raw_tls);
+                                    //entry.cert_chain = None;
+                                    entry.stale = false;
+                                }else{
+                                    debug!("Out-of-order TCP datagrams detected {:?}", key); // TODO: This error doesn't tell the whole story
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                panic!("Inconsistent server_cache {:?}", key);
+            }
+        } else { // if server_seen
+            //debug!("No server_cache key {:?}", key);
+            match parse_cert(&payload) {
+                Ok(cert_chain) => {
+                    debug!("cert_len: {:?}", cert_chain.len());
+
+                    debug!("Handling validation cert_len: {:?}", cert_chain.len());
+                    handle_validation(Arc::clone(&acl_cache), Arc::clone(&client_cache),
+                                      cert_chain.clone(), ip_src, ip_dst, tcp_header.destination_port);
+
+                    debug!("Finalizing server_cache entry: {:?}", key);
+                    server_cache.write().insert(key.clone(), ServerCacheEntry {
+                        ts: SystemTime::now(),
+                        seq: None,
+                        data: None,
+                        //cert_chain: Some(cert_chain.clone()),
+                        stale: true,
+                    });
+                }
+                Err(err)=> {
+                    match err { // TODO: Why check errors if they all result in the same action
+                        CertParseError::IncompleteTlsRecord | CertParseError::WrongTlsRecord => {
+                            debug!("Inserting server_cache entry: {:?}", key);
+                            server_cache.write().insert(key, ServerCacheEntry {
+                                ts: SystemTime::now(),
+                                seq: Some(tcp_header.sequence_number + payload.len() as u32),
+                                data: Some(payload.to_vec()),
+                                //cert_chain: None,
+                                stale: false,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        debug!("ServerHello begun but no client_cache entry for {:?}", key);
+    }
 }
 
 // Die gracefully
