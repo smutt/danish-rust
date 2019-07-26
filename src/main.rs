@@ -90,16 +90,17 @@ fn main() {
 
     // Setup our caches
     // TODO: We may get better cache entry atomicity if we use crate chashmap
-    let client_cache_v4 = Arc::new(RwLock::new(HashMap::<String, ClientCacheEntry>::new()));
-    let client_cache_v4_srv = Arc::clone(&client_cache_v4); // Reference for server_4_thr
-    let server_cache_v4 = Arc::new(RwLock::new(HashMap::<String, ServerCacheEntry>::new()));
+    let client_cache_v4 = Arc::new(RwLock::new(HashMap::<String, ClientCacheEntry>::new())); // client_4_thr
+    let client_cache_v4_srv = Arc::clone(&client_cache_v4); // server_4_thr
+    let client_cache_v6 = Arc::new(RwLock::new(HashMap::<String, ClientCacheEntry>::new())); // client_6_thr
+    let client_cache_v6_srv = Arc::clone(&client_cache_v6); // server_6_thr
 
-    let client_cache_v6 = Arc::new(RwLock::new(HashMap::<String, ClientCacheEntry>::new()));
-    let client_cache_v6_srv = Arc::clone(&client_cache_v6); // Reference for server_6_thr
-    let server_cache_v6 = Arc::new(RwLock::new(HashMap::<String, ServerCacheEntry>::new()));
+    let server_cache_v4 = Arc::new(RwLock::new(HashMap::<String, ServerCacheEntry>::new())); // server_4_thr
+    let server_cache_v6 = Arc::new(RwLock::new(HashMap::<String, ServerCacheEntry>::new())); // server_6_thr
 
-    let acl_cache = Arc::new(RwLock::new(HashMap::<String, AclCacheEntry>::new()));
-    let acl_cache_clean = Arc::clone(&acl_cache); // Reference for acl_clean_thr
+    let acl_cache_v4 = Arc::new(RwLock::new(HashMap::<String, AclCacheEntry>::new())); // server_4_thr
+    let acl_cache_v6 = Arc::clone(&acl_cache_v4); // server_6_thr
+    let acl_cache_clean = Arc::clone(&acl_cache_v4); // acl_clean_thr
 
     // Setup iptables
     match iptables::new(false) {
@@ -191,7 +192,6 @@ fn main() {
     threads.push(acl_clean_thr);
 
     let client_4_thr = thread::spawn(move || {
-        // ACK == 1 && RST == 0 && SYN == 0 && FIN == 0 && must accept TCP fragments
         let bpf_client_4 = "(tcp[((tcp[12:1] & 0xf0) >> 2)+5:1] = 0x01) and (tcp[((tcp[12:1] & 0xf0) >> 2):1] = 0x16) and (dst port 443)";
         let mut capture = Device::lookup().unwrap().open().unwrap();
         match capture.filter(bpf_client_4){
@@ -216,7 +216,7 @@ fn main() {
             }
             drop(stale);
 
-            let pkt = PacketHeaders::from_ethernet_slice(&packet).expect("Failed to decode packet");
+            let pkt = PacketHeaders::from_ethernet_slice(&packet).expect("Failed to decode packet in client_4_thr");
             //debug!("Everything: {:?}", pkt);
 
             match pkt.ip.unwrap() {
@@ -224,17 +224,17 @@ fn main() {
                     warn!("IPv6 packet captured when IPv4 expected");
                     continue;
                 }
-                Version4(ref value) => {
-                    let ip_src = ipv4::new(ipv4_display(&value.source)).unwrap();
-                    let ip_dst = ipv4::new(ipv4_display(&value.destination)).unwrap();
-
+                Version4(ipv4) => {
                     match pkt.transport.unwrap() {
                         Udp(_) => error!("UDP transport captured when TCP expected"),
-                        Tcp(ref value) => {
+                        Tcp(tcp) => {
                             match parse_sni(pkt.payload) { // Let's assume SNI comes in one packet
                                 Err(_) => error!("Error parsing SNI"),
                                 Ok(sni) => {
-                                    let key = derive_cache_key(&ip_src, &ip_dst, &value.source_port);
+                                    let key = derive_cache_key(&ipv4::new(ipv4_display(&ipv4.source)).unwrap(),
+                                                               &ipv4::new(ipv4_display(&ipv4.destination)).unwrap(),
+                                                               &tcp.source_port);
+
                                     debug!("Inserting client_cache_v4 entry: {:?} sni: {:?}", key, sni);
                                     client_cache_v4.write().insert(key.clone(),
                                         ClientCacheEntry {
@@ -254,6 +254,68 @@ fn main() {
         }
     });
     threads.push(client_4_thr);
+
+    let server_4_thr = thread::spawn(move || {
+        let bpf_server_4 = "tcp and src port 443 and (tcp[tcpflags] & tcp-ack = 16) and (tcp[tcpflags] & tcp-syn != 2) and 
+        (tcp[tcpflags] & tcp-fin != 1) and (tcp[tcpflags] & tcp-rst != 1)";
+
+        let mut capture = Device::lookup().unwrap().open().unwrap();
+        match capture.filter(bpf_server_4){
+            Ok(_) => (),
+            Err(err) => error!("BPF error {}", err.to_string()),
+        }
+
+        while let Ok(packet) = capture.next() {
+            debug!("Investigating server_cache_v4 staleness {:?}", server_cache_v4.read().len());
+            let mut stale = Vec::new();
+            for (key,entry) in server_cache_v4.read().iter() {
+                if entry.stale {
+                    if entry.ts < SystemTime::now() - Duration::new(CACHE_MIN_STALENESS, 0) {
+                        stale.push(key.clone());
+                        debug!("Found stale server_cache_v4 entry {:?}", key);
+                    }
+                }
+            }
+            for key in stale.iter() {
+                server_cache_v4.write().remove(key);
+                debug!("Deleted stale server_cache_v4 entry {:?}", key);
+            }
+            drop(stale);
+
+            /* pcap/Etherparse strips the Ethernet FCS before it hands the packet to us.
+            So a 60 byte packet was 64 bytes on the wire.
+            Etherparse interprets any Ethernet padding as TCP data. I consider this a bug.
+            Therefore, we ignore any packet 60 bytes or less to prevent us from storing erroneous TCP payloads.
+            The chances of us actually needing that small of a packet are close to zero. */
+            if packet.len() <= 60 {
+                continue;
+            }
+
+            let pkt = PacketHeaders::from_ethernet_slice(&packet).expect("Failed to decode packet in server_4_thr");
+            //debug!("Everything: {:?}", pkt);
+
+            match pkt.ip.unwrap() {
+                Version6(_) => {
+                    warn!("IPv6 packet captured, but IPv4 expected");
+                    continue;
+                }
+                Version4(ipv4) => {
+                    match pkt.transport.unwrap() {
+                        Udp(_) => warn!("UDP transport captured when TCP expected"),
+                        Tcp(tcp) => {
+                            //debug!("resp_tcp_seq: {:?}", tcp.sequence_number);
+                            //debug!("payload_len: {:?}", pkt.payload.len());
+                            parse_server_hello(&acl_cache_v4, &client_cache_v4_srv, &server_cache_v4,
+                                               ipv4::new(ipv4_display(&ipv4.source)).unwrap(),
+                                               ipv4::new(ipv4_display(&ipv4.destination)).unwrap(),
+                                               tcp, pkt.payload);
+                        }
+                    }
+                }
+            }
+        }
+    });
+    threads.push(server_4_thr);
 
     if ipv6_enabled() {
         let client_6_thr = thread::spawn(move || {
@@ -281,7 +343,7 @@ fn main() {
                 }
                 drop(stale);
 
-                let pkt = PacketHeaders::from_ethernet_slice(&packet).expect("Failed to decode packet");
+                let pkt = PacketHeaders::from_ethernet_slice(&packet).expect("Failed to decode packet in client_6_thr");
                 //debug!("Everything: {:?}", pkt);
 
                 match pkt.ip.unwrap() {
@@ -289,27 +351,29 @@ fn main() {
                         warn!("IPv4 packet captured when IPv6 expected");
                         continue;
                     }
-                    Version6(ref value) => {
-                        if pkt.payload.len() > 0 && pkt.payload[1] == 22 {
-                            let ip_src = ipv6::new(ipv6_display(&value.source)).unwrap();
-                            let ip_dst = ipv6::new(ipv6_display(&value.destination)).unwrap();
+                    Version6(ipv6) => {
+                        if pkt.payload.len() > 0 {
+                            if pkt.payload[0] == 22 {
+                                match pkt.transport.unwrap() {
+                                    Udp(_) => error!("UDP transport captured when TCP expected"),
+                                    Tcp(tcp) => {
+                                        match parse_sni(pkt.payload) { // Let's assume SNI comes in one packet
+                                            Err(_) => error!("Error parsing SNI"),
+                                            Ok(sni) => {
+                                                let key = derive_cache_key(&ipv6::new(ipv6_display(&ipv6.source)).unwrap(),
+                                                                           &ipv6::new(ipv6_display(&ipv6.destination)).unwrap(),                              
+                                                                           &tcp.source_port);
 
-                            match pkt.transport.unwrap() {
-                                Udp(_) => error!("UDP transport captured when TCP expected"),
-                                Tcp(ref value) => {
-                                    match parse_sni(pkt.payload) { // Let's assume SNI comes in one packet
-                                        Err(_) => error!("Error parsing SNI"),
-                                        Ok(sni) => {
-                                            let key = derive_cache_key(&ip_src, &ip_dst, &value.source_port);
-                                            debug!("Inserting client_cache_v6 entry: {:?} sni: {:?}", key, sni);
-                                            client_cache_v6.write().insert(key.clone(), ClientCacheEntry {
-                                                ts: SystemTime::now(),
-                                                sni: sni.clone(),
-                                                tlsa: None,
-                                                response: false,
-                                                stale: false,
-                                            });
-                                            dns_lookup_tlsa(Arc::clone(&client_cache_v6), key.clone());
+                                                debug!("Inserting client_cache_v6 entry: {:?} sni: {:?}", key, sni);
+                                                client_cache_v6.write().insert(key.clone(), ClientCacheEntry {
+                                                    ts: SystemTime::now(),
+                                                    sni: sni.clone(),
+                                                    tlsa: None,
+                                                    response: false,
+                                                    stale: false,
+                                                });
+                                                dns_lookup_tlsa(Arc::clone(&client_cache_v6), key.clone());
+                                            }
                                         }
                                     }
                                 }
@@ -320,71 +384,72 @@ fn main() {
             }
         });
         threads.push(client_6_thr);
-    }
 
-    let server_4_thr = thread::spawn(move || {
-        // ACK == 1 && RST == 0 && SYN == 0 && FIN == 0 && must accept TCP fragments
-        let bpf_server_4 = "tcp and src port 443 and (tcp[tcpflags] & tcp-ack = 16) and (tcp[tcpflags] & tcp-syn != 2) and 
-        (tcp[tcpflags] & tcp-fin != 1) and (tcp[tcpflags] & tcp-rst != 1)";
+        let server_6_thr = thread::spawn(move || {
+            let bpf_server_6 = "ip6 and tcp and src port 443";
 
-        let mut capture = Device::lookup().unwrap().open().unwrap();
-        match capture.filter(bpf_server_4){
-            Ok(_) => (),
-            Err(err) => error!("BPF error {}", err.to_string()),
-        }
+            let mut capture = Device::lookup().unwrap().open().unwrap();
+            match capture.filter(bpf_server_6){
+                Ok(_) => (),
+                Err(err) => error!("BPF error {}", err.to_string()),
+            }
 
-        while let Ok(resp_packet) = capture.next() {
-            debug!("Investigating server_cache_v4 staleness {:?}", server_cache_v4.read().len());
-            let mut stale = Vec::new();
-            for (key,entry) in server_cache_v4.read().iter() {
-                if entry.stale {
-                    if entry.ts < SystemTime::now() - Duration::new(CACHE_MIN_STALENESS, 0) {
-                        stale.push(key.clone());
-                        debug!("Found stale server_cache_v4 entry {:?}", key);
+            while let Ok(packet) = capture.next() {
+                debug!("Investigating server_cache_v6 staleness {:?}", server_cache_v6.read().len());
+                let mut stale = Vec::new();
+                for (key,entry) in server_cache_v6.read().iter() {
+                    if entry.stale {
+                        if entry.ts < SystemTime::now() - Duration::new(CACHE_MIN_STALENESS, 0) {
+                            stale.push(key.clone());
+                            debug!("Found stale server_cache_v6 entry {:?}", key);
+                        }
                     }
                 }
-            }
-            for key in stale.iter() {
-                server_cache_v4.write().remove(key);
-                debug!("Deleted stale server_cache_v4 entry {:?}", key);
-            }
-            drop(stale);
+                for key in stale.iter() {
+                    server_cache_v6.write().remove(key);
+                    debug!("Deleted stale server_cache_v6 entry {:?}", key);
+                }
+                drop(stale);
 
-            /* pcap/Etherparse strips the Ethernet FCS before it hands the packet to us.
-            So a 60 byte packet was 64 bytes on the wire.
-            Etherparse interprets any Ethernet padding as TCP data. I consider this a bug.
-            Therefore, we ignore any packet 60 bytes or less to prevent us from storing erroneous TCP payloads.
-            The chances of us actually needing that small of a packet are close to zero. */
-            if resp_packet.len() <= 60 {
-                continue;
-            }
-
-            let pkt = PacketHeaders::from_ethernet_slice(&resp_packet)
-                .expect("Failed to decode resp_packet");
-            //debug!("Everything: {:?}", pkt);
-
-            match pkt.ip.unwrap() {
-                Version6(_) => {
-                    warn!("IPv6 packet captured, but IPv4 expected");
+                /* pcap/Etherparse strips the Ethernet FCS before it hands the packet to us.
+                So a 60 byte packet was 64 bytes on the wire.
+                Etherparse interprets any Ethernet padding as TCP data. I consider this a bug.
+                Therefore, we ignore any packet 60 bytes or less to prevent us from storing erroneous TCP payloads.
+                The chances of us actually needing that small of a packet are close to zero. */
+                if packet.len() <= 60 {
                     continue;
                 }
-                Version4(ref value) => {
-                    match pkt.transport.unwrap() {
-                        Udp(_) => warn!("UDP transport captured when TCP expected"),
-                        Tcp(tcp) => {
-                            //debug!("resp_tcp_seq: {:?}", tcp.sequence_number);
-                            //debug!("payload_len: {:?}", pkt.payload.len());
-                            parse_server_hello(&acl_cache, &client_cache_v4_srv, &server_cache_v4,
-                                               ipv4::new(ipv4_display(&value.source)).unwrap(),
-                                               ipv4::new(ipv4_display(&value.destination)).unwrap(),
-                                               tcp, pkt.payload);
+
+                let pkt = PacketHeaders::from_ethernet_slice(&packet).expect("Failed to decode packet in server_6_thr");
+                //debug!("Everything: {:?}", pkt);
+
+                match pkt.ip.unwrap() {
+                    Version4(_) => {
+                        warn!("IPv4 packet captured, but IPv6 expected");
+                        continue;
+                    }
+                    Version6(ipv6) => {
+                        match pkt.transport.unwrap() {
+                            Udp(_) => warn!("UDP transport captured when TCP expected"),
+                            Tcp(tcp) => {
+                                //debug!("resp_tcp_seq: {:?}", tcp.sequence_number);
+                                //debug!("payload_len: {:?}", pkt.payload.len());
+                                if pkt.payload.len() > 0 {
+                                    if tcp.ack && !tcp.rst && !tcp.syn && !tcp.fin {
+                                        parse_server_hello(&acl_cache_v6, &client_cache_v6_srv, &server_cache_v6,
+                                                           ipv6::new(ipv6_display(&ipv6.source)).unwrap(),
+                                                           ipv6::new(ipv6_display(&ipv6.destination)).unwrap(),
+                                                           tcp, pkt.payload);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
-        }
-    });
-    threads.push(server_4_thr);
+        });
+        threads.push(server_6_thr);
+    }
 
     for thr in threads {
         thr.join().unwrap();
@@ -826,6 +891,7 @@ fn validate_tlsa(tlsa_rrset: &Vec<TLSA>, cert_chain: &Vec<Vec<u8>>) -> bool {
     return false;
 }
 
+// TODO get stricter about the kinds of TLS packets we accept. crib from the python
 // Parse the X.509 cert from TLS ServerHello Messages
 // Recursively call parse_tls_plaintext() until we find the TLS Certificate Record or Error
 fn parse_cert(payload: &[u8]) -> Result<Vec<Vec<u8>>, CertParseError> {
@@ -853,6 +919,7 @@ fn parse_cert(payload: &[u8]) -> Result<Vec<Vec<u8>>, CertParseError> {
     }
 }
 
+// TODO get stricter about the kinds of TLS packets we accept. crib from the python
 // Parse out the SNI from passed TLS payload
 fn parse_sni(payload: &[u8]) -> Result<String, SniParseError> {
     match tls::parse_tls_plaintext(payload) {
