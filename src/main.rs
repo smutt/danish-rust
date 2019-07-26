@@ -361,7 +361,7 @@ fn main() {
                                             Err(_) => error!("Error parsing SNI"),
                                             Ok(sni) => {
                                                 let key = derive_cache_key(&ipv6::new(ipv6_display(&ipv6.source)).unwrap(),
-                                                                           &ipv6::new(ipv6_display(&ipv6.destination)).unwrap(),                              
+                                                                           &ipv6::new(ipv6_display(&ipv6.destination)).unwrap(),
                                                                            &tcp.source_port);
 
                                                 debug!("Inserting client_cache_v6 entry: {:?} sni: {:?}", key, sni);
