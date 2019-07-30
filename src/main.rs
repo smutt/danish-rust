@@ -370,8 +370,8 @@ fn main() {
                         continue;
                     }
                     Version6(ipv6) => {
-                        if pkt.payload.len() > 0 {
-                            if pkt.payload[0] == 22 {
+                        if pkt.payload.len() > 64 { // Somewhat arbitrary minimum
+                            if pkt.payload[0] == 22 && pkt.payload[5] == 1 { // tls.handshake and tls.handshake.type.client_hello
                                 match pkt.transport.unwrap() {
                                     Udp(_) => error!("UDP transport captured when TCP expected"),
                                     Tcp(tcp) => {
@@ -379,7 +379,7 @@ fn main() {
                                             Err(err) => {
                                                 match err {
                                                     SniParseError::ClientHelloNotFound | SniParseError::IncorrectMsgType =>
-                                                        debug!("SNI not foundin pkt, likely not TLS ClientHello"),
+                                                        debug!("SNI not found in pkt, likely not TLS ClientHello"),
                                                     _ => error!("Error parsing SNI"),
                                                 }
                                             }
