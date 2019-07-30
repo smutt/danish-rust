@@ -135,7 +135,7 @@ fn main() {
     }
 
     // ACL clean up thread
-    let acl_clean_thr = thread::spawn(move || { // TODO: Name all threads https://doc.rust-lang.org/std/thread/
+    let acl_clean_thr = thread::Builder::new().name("acl_clean".to_string()).spawn(move || {
         loop {
             thread::sleep(time::Duration::new(ACL_CACHE_DELAY, 0));
             debug!("Investigating acl_cache staleness {:?}", acl_cache_clean.read().len());
@@ -200,10 +200,10 @@ fn main() {
                 }
             }
         }
-    });
+    }).unwrap();
     threads.push(acl_clean_thr);
 
-    let client_4_thr = thread::spawn(move || {
+    let client_4_thr = thread::Builder::new().name("client_4".to_string()).spawn(move || {
         let bpf_client_4 = "(tcp[((tcp[12:1] & 0xf0) >> 2)+5:1] = 0x01) and (tcp[((tcp[12:1] & 0xf0) >> 2):1] = 0x16) and (dst port 443)";
         let mut capture = Device::lookup().unwrap().open().unwrap();
         match capture.filter(bpf_client_4){
@@ -264,10 +264,10 @@ fn main() {
                 }
             }
         }
-    });
+    }).unwrap();
     threads.push(client_4_thr);
 
-    let server_4_thr = thread::spawn(move || {
+    let server_4_thr = thread::Builder::new().name("server_4".to_string()).spawn(move || {
         let bpf_server_4 = "tcp and src port 443 and (tcp[tcpflags] & tcp-ack = 16) and (tcp[tcpflags] & tcp-syn != 2) and 
         (tcp[tcpflags] & tcp-fin != 1) and (tcp[tcpflags] & tcp-rst != 1)";
 
@@ -326,11 +326,11 @@ fn main() {
                 }
             }
         }
-    });
+    }).unwrap();
     threads.push(server_4_thr);
 
     if ipv6_enabled() {
-        let client_6_thr = thread::spawn(move || {
+        let client_6_thr = thread::Builder::new().name("client_6".to_string()).spawn(move || {
             let bpf_client_6 = "ip6 and tcp and dst port 443";
             let mut capture = Device::lookup().unwrap().open().unwrap();
             match capture.filter(bpf_client_6){
@@ -394,10 +394,10 @@ fn main() {
                     }
                 }
             }
-        });
+        }).unwrap();
         threads.push(client_6_thr);
 
-        let server_6_thr = thread::spawn(move || {
+        let server_6_thr = thread::Builder::new().name("server_6".to_string()).spawn(move || {
             let bpf_server_6 = "ip6 and tcp and src port 443";
 
             let mut capture = Device::lookup().unwrap().open().unwrap();
@@ -459,7 +459,7 @@ fn main() {
                     }
                 }
             }
-        });
+        }).unwrap();
         threads.push(server_6_thr);
     }
 
