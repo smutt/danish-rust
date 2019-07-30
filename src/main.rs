@@ -241,7 +241,13 @@ fn main() {
                         Udp(_) => error!("UDP transport captured when TCP expected"),
                         Tcp(tcp) => {
                             match parse_sni(pkt.payload) { // Let's assume SNI comes in one packet
-                                Err(_) => error!("Error parsing SNI"),
+                                Err(err) => {
+                                    match err {
+                                        SniParseError::ClientHelloNotFound | SniParseError::IncorrectMsgType =>
+                                            debug!("SNI not found in pkt, likely not TLS ClientHello"),
+                                        _ => error!("Error parsing SNI"),
+                                    }
+                                }
                                 Ok(sni) => {
                                     let key = derive_cache_key(&ipv4::new(ipv4_display(&ipv4.source)).unwrap(),
                                                                &ipv4::new(ipv4_display(&ipv4.destination)).unwrap(),
@@ -370,7 +376,13 @@ fn main() {
                                     Udp(_) => error!("UDP transport captured when TCP expected"),
                                     Tcp(tcp) => {
                                         match parse_sni(pkt.payload) { // Let's assume SNI comes in one packet
-                                            Err(_) => error!("Error parsing SNI"),
+                                            Err(err) => {
+                                                match err {
+                                                    SniParseError::ClientHelloNotFound | SniParseError::IncorrectMsgType =>
+                                                        debug!("SNI not foundin pkt, likely not TLS ClientHello"),
+                                                    _ => error!("Error parsing SNI"),
+                                                }
+                                            }
                                             Ok(sni) => {
                                                 let key = derive_cache_key(&ipv6::new(ipv6_display(&ipv6.source)).unwrap(),
                                                                            &ipv6::new(ipv6_display(&ipv6.destination)).unwrap(),
@@ -799,10 +811,10 @@ fn ipt_del_long(ipt: &iptables::IPTables, chain: &String) -> Result<(), iptables
 // Takes RData of DNS TLSA RRSET and DER encoded X.509 cert chain
 // Returns True on valid and False on invalid
 fn validate_tlsa(tlsa_rrset: &Vec<TLSA>, cert_chain: &Vec<Vec<u8>>) -> bool {
-    debug!("Entered validate_tlsa() tlsa_rrset: {:?}", tlsa_rrset);
+    //debug!("Entered validate_tlsa() tlsa_rrset: {:?}", tlsa_rrset);
     let mut certs: Vec<Vec<u8>>;
     for tlsa in tlsa_rrset {
-        debug!("tlsa: {:?}", tlsa);
+        //debug!("tlsa: {:?}", tlsa);
         match tlsa.selector {
             0 => certs = cert_chain.clone(),
             1 => {
@@ -861,13 +873,11 @@ fn validate_tlsa(tlsa_rrset: &Vec<TLSA>, cert_chain: &Vec<Vec<u8>>) -> bool {
                         }
                     }
                     1 => {
-                        debug!("hash: {:?}", Sha256::digest(&certs[0]));
                         if tlsa.data == Sha256::digest(&certs[0]).as_slice(){
                             return true;
                         }
                     }
                     2 => {
-                        debug!("hash: {:?}", Sha512::digest(&certs[0]));
                         if tlsa.data == Sha512::digest(&certs[0]).as_slice() {
                             return true;
                         }
