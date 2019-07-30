@@ -135,7 +135,7 @@ fn main() {
     }
 
     // ACL clean up thread
-    let acl_clean_thr = thread::spawn(move || {
+    let acl_clean_thr = thread::spawn(move || { // TODO: Name all threads https://doc.rust-lang.org/std/thread/
         loop {
             thread::sleep(time::Duration::new(ACL_CACHE_DELAY, 0));
             debug!("Investigating acl_cache staleness {:?}", acl_cache_clean.read().len());
@@ -983,11 +983,11 @@ fn ipv4_display(ip: &[u8;4]) -> String {
 // Returns display formatted string for ipv6 address
 fn ipv6_display(ip: &[u8;16]) -> String {
     let mut rv = "".to_string();
-    for ii in 0..15 {
-        rv.push_str(&ip[ii].to_string());
-        if ii % 2 == 0 {
+    for ii in 0..16 {
+        if ii % 2 == 0 && ii != 0 {
             rv.push_str(":");
         }
+        rv.push_str(&format!("{:01$x}", &ip[ii], 2));
     }
     rv
 }
