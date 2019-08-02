@@ -26,9 +26,10 @@ use structopt::StructOpt;
 // CONSTANTS
 const DNS_TIMEOUT: u64 = 1000; // Timeout for DNS queries in milliseconds, must be divisible by DNS_TIMEOUT_DECREMENT
 const DNS_TIMEOUT_DECREMENT: u64 = 20; // Decrement for counting down to zero from DNS_TIMEOUT in milliseconds
-const IPT_DANISH_CHAIN: &str = "danish"; // iptables parent chain and beginning of each child chain, TODO: make this configurable
 const IPT_DELIM: &str = "_"; // iptables delimeter for child chains (IPT_DANISH_CHAIN + IPT_DELIM + TRUNCATED_HASH)
 const IPT_MAX_CHARS: usize = 28; // maxchars for iptables chain names on Linux
+const IPT_SUBCHAIN_MIN_CHARS: usize = 3; // minchars for --sub-chain 
+const IPT_SUBCHAIN_MAX_CHARS: usize = 8; // maxchars for --sub-chain 
 const CACHE_MIN_STALENESS: u64 = 10; // minimum seconds for a stale [client || server] cache entry to live before deletion
 const ACL_CACHE_DELAY: u64 = 10; // Sleep this many seconds between acl_cache cleanup cycles
 const ACL_SHORT_TIMEOUT: u64 = 60; // How many seconds do our short ACLs remain installed?
@@ -80,9 +81,12 @@ struct AclCacheEntry { // Key in hashmap is iptables chain name
 
 #[derive(Debug, StructOpt)]
 struct Opt {
-    /// iptables/ip6tables chain for ACLs
+    /// iptables/ip6tables top chain
     #[structopt(short = "c", long = "chain", default_value = "OUTPUT")]
     chain: String,
+    /// iptables/ip6tables sub-chain for ACLs
+    #[structopt(short = "s", long = "sub-chain", default_value = "danish")]
+    sub_chain: String,
 }
 
 fn main() {
@@ -111,23 +115,39 @@ fn main() {
     let acl_cache_v6 = Arc::clone(&acl_cache_v4); // server_6_thr
     let acl_cache_clean = Arc::clone(&acl_cache_v4); // acl_clean_thr
 
-    // Setup iptables
-    if  cli_opts.chain.to_uppercase() != "OUTPUT".to_string() && cli_opts.chain.to_uppercase() != "FORWARD".to_string() {
+    // Check our input
+    if cli_opts.chain.to_uppercase() != "OUTPUT".to_string() && cli_opts.chain.to_uppercase() != "FORWARD".to_string() {
         panic!("Invalid iptables/ip6tables chain {:?}", cli_opts.chain.to_uppercase());
     }
+    if cli_opts.sub_chain.len() > IPT_SUBCHAIN_MAX_CHARS { 
+        panic!("sub-chain argument too long {:?}", cli_opts.sub_chain);
+    }
+    if cli_opts.sub_chain.len() < IPT_SUBCHAIN_MIN_CHARS {
+        panic!("sub-chain argument too short {:?}", cli_opts.sub_chain);
+    }
+    if !cli_opts.sub_chain.is_ascii() {
+        panic!("non-ASCII character in sub-chain");
+    }
+    for cc in cli_opts.sub_chain.chars() {
+        if !cc.is_ascii_alphanumeric() {
+            panic!("Invalid ASCII character in sub-chain");
+        }
+    }
+
+    // Setup iptables
     match iptables::new(false) {
         Err(_) => panic!("FATAL iptables error"),
         Ok(ipt) => {
-            ipt.new_chain("filter", IPT_DANISH_CHAIN).expect("FATAL iptables error");
-            ipt.insert_unique("filter", IPT_DANISH_CHAIN, "-j RETURN", 1).expect("FATAL iptables error");
-            ipt.insert_unique("filter", &cli_opts.chain.to_uppercase(), &format!("{} {}", "-j", IPT_DANISH_CHAIN), 1).expect("FATAL iptables error");
+            ipt.new_chain("filter", &cli_opts.sub_chain).expect("FATAL iptables error");
+            ipt.insert_unique("filter", &cli_opts.sub_chain, "-j RETURN", 1).expect("FATAL iptables error");
+            ipt.insert_unique("filter", &cli_opts.chain.to_uppercase(), &format!("{} {}", "-j", &cli_opts.sub_chain), 1).expect("FATAL iptables error");
             if ipv6_enabled() {
                 match iptables::new(true) {
                     Err(_) => panic!("FATAL ip6tables error"),
                     Ok(ipt6) => {
-                        ipt6.new_chain("filter", IPT_DANISH_CHAIN).expect("FATAL ip6tables error");
-                        ipt6.insert_unique("filter", IPT_DANISH_CHAIN, "-j RETURN", 1).expect("FATAL ip6tables error");
-                        ipt6.insert_unique("filter", &cli_opts.chain.to_uppercase(), &format!("{} {}", "-j", IPT_DANISH_CHAIN), 1).expect("FATAL ip6tables error");
+                        ipt6.new_chain("filter", &cli_opts.sub_chain).expect("FATAL ip6tables error");
+                        ipt6.insert_unique("filter", &cli_opts.sub_chain, "-j RETURN", 1).expect("FATAL ip6tables error");
+                        ipt6.insert_unique("filter", &cli_opts.chain.to_uppercase(), &format!("{} {}", "-j", &cli_opts.sub_chain), 1).expect("FATAL ip6tables error");
                     }
                 }
             }
@@ -592,18 +612,18 @@ fn euthanize() {
     match iptables::new(false) {
         Err(_) => panic!("FATAL iptables error"),
         Ok(ipt) => {
-            ipt.delete("filter", &cli_opts.chain.to_uppercase(), &format!("{} {}", "-j", IPT_DANISH_CHAIN)).expect("FATAL iptables error");
+            ipt.delete("filter", &cli_opts.chain.to_uppercase(), &format!("{} {}", "-j", cli_opts.sub_chain)).expect("FATAL iptables error");
             let sub_chains = ipt.list_chains("filter").expect("FATAL iptables error");
-            ipt.flush_chain("filter", IPT_DANISH_CHAIN).expect("FATAL iptables error");
+            ipt.flush_chain("filter", &cli_opts.sub_chain).expect("FATAL iptables error");
 
             for chain in sub_chains.iter() {
-                if chain.starts_with(&format!("{}{}", IPT_DANISH_CHAIN, IPT_DELIM)) {
+                if chain.starts_with(&format!("{}{}", cli_opts.sub_chain, IPT_DELIM)) {
                     ipt.flush_chain("filter", chain).expect("FATAL iptables error");
                     ipt.delete_chain("filter", chain).expect("FATAL iptables error");
                 }
             }
 
-            ipt.delete_chain("filter", IPT_DANISH_CHAIN).expect("FATAL iptables error");
+            ipt.delete_chain("filter", &cli_opts.sub_chain).expect("FATAL iptables error");
         }
     }
 
@@ -612,18 +632,18 @@ fn euthanize() {
         match iptables::new(true) {
             Err(_) => panic!("FATAL ip6tables error"),
             Ok(ipt) => {
-                ipt.delete("filter", &cli_opts.chain.to_uppercase(), &format!("{} {}", "-j", IPT_DANISH_CHAIN)).expect("FATAL ip6tables error");
+                ipt.delete("filter", &cli_opts.chain.to_uppercase(), &format!("{} {}", "-j", cli_opts.sub_chain)).expect("FATAL ip6tables error");
                 let sub_chains = ipt.list_chains("filter").expect("FATAL ip6tables error");
-                ipt.flush_chain("filter", IPT_DANISH_CHAIN).expect("FATAL ip6tables error");
+                ipt.flush_chain("filter", &cli_opts.sub_chain).expect("FATAL ip6tables error");
 
                 for chain in sub_chains.iter() {
-                    if chain.starts_with(&format!("{}{}", IPT_DANISH_CHAIN, IPT_DELIM)) {
+                    if chain.starts_with(&format!("{}{}", cli_opts.sub_chain, IPT_DELIM)) {
                         ipt.flush_chain("filter", chain).expect("FATAL ip6tables error");
                         ipt.delete_chain("filter", chain).expect("FATAL ip6tables error");
                     }
                 }
 
-                ipt.delete_chain("filter", IPT_DANISH_CHAIN).expect("FATAL ip6tables error");
+                ipt.delete_chain("filter", &cli_opts.sub_chain).expect("FATAL ip6tables error");
             }
         }
     }
@@ -744,9 +764,10 @@ fn handle_validation(acl_cache: Arc<RwLock<HashMap<String, AclCacheEntry>>>,
 // Adds a new iptables chain and links it to main Danish chain
 fn ipt_add_chain(ipt: &iptables::IPTables, chain: &String) -> Result<(), iptables::error::IPTError> {
     debug!("Creating then inserting into {:?}", chain);
+    let cli_opts: Opt = Opt::from_args();
     ipt.new_chain("filter", &chain)?;
     ipt.insert_unique("filter", &chain, "-j RETURN", 1)?;
-    ipt.insert_unique("filter", IPT_DANISH_CHAIN, &format!("{} {}", "-j", &chain), 1)?;
+    ipt.insert_unique("filter", &cli_opts.sub_chain, &format!("{} {}", "-j", &chain), 1)?;
     return Ok(());
 }
 
@@ -779,7 +800,8 @@ fn ipt_add_long(ipt: &iptables::IPTables, chain: &String, sni: &String) -> Resul
 // Delinks then deletes an existing iptables chain
 fn ipt_del_chain(ipt: &iptables::IPTables, chain: &String) -> Result<(), iptables::error::IPTError> {
     debug!("Deleting chain {:?}", chain);
-    ipt.delete("filter", IPT_DANISH_CHAIN, &format!("{} {}", "-j", &chain))?;
+    let cli_opts: Opt = Opt::from_args();
+    ipt.delete("filter", &cli_opts.sub_chain, &format!("{} {}", "-j", &chain))?;
     ipt.flush_chain("filter", &chain)?;
     ipt.delete_chain("filter", &chain)?;
     return Ok(());
@@ -1017,9 +1039,10 @@ fn ipv6_enabled() -> bool {
 
 // Returns an unused iptables and ip6tables chain name
 fn unique_chain_name(name: &str) -> String {
-    let id_len: usize = (IPT_MAX_CHARS - IPT_DANISH_CHAIN.len() - IPT_DELIM.len()) / 2;
+    let cli_opts: Opt = Opt::from_args();
+    let id_len: usize = (IPT_MAX_CHARS - cli_opts.sub_chain.len() - IPT_DELIM.len()) / 2;
     let hash = Sha256::digest(&name.as_bytes()).to_vec()[0..id_len].to_vec();
-    let attempt = format!("{}{}{}", IPT_DANISH_CHAIN, IPT_DELIM,
+    let attempt = format!("{}{}{}", cli_opts.sub_chain, IPT_DELIM,
                           hash.iter().map(|x| format!("{:x}", x)).collect::<String>());
 
     match iptables::new(false) {
