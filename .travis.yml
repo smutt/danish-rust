@@ -1,0 +1,13 @@
+language: rust
+sudo: false
+addons:
+  apt:
+    packages: [libpcap0.8, libpcap0.8-dev]
+rust:
+  - stable
+  - beta
+  - nightly
+matrix:
+  allow_failures:
+    - rust: nightly
+  fast_finish: true
