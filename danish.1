@@ -1,7 +1,7 @@
 .\" Manpage for danish.
 .\" Copyright (c) 2019, Andrew McConachie <andrew@depht.com>
 .\" All rights reserved.
-.TH man 1 "12 Aug 2019" "0.1" "danish man page"
+.TH man 1 "13 Aug 2019" "0.1" "danish man page"
 
 .SH NAME
 danish \- Middle-box DANE for HTTPS.
@@ -35,9 +35,12 @@ offending website.
 -h, --help
 display help and exit
 .TP
--s, -sub-chain
+-s, --sub-chain
 iptables/ip6tables sub-chain for installing ACLs. Special chain used
 only for danish ACLs. Default value is danish.
+.TP
+-v,--version
+display version information and exit
 .SH SEE ALSO
 pcap(3), iptables(8), ssl(7), resolv.conf(5)
 .SH SUPPORT
