@@ -1,3 +1,8 @@
+/*
+Copyright (c) 2019, Andrew McConachie <andrew@depht.com>
+All rights reserved.
+*/
+
 #[macro_use]
 extern crate log;
 
