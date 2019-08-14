@@ -1,4 +1,7 @@
 ## Overview
+
+[![Build Status](https://travis-ci.org/smutt/danish-rust.svg?branch=master)](https://travis-ci.org/smutt/danish-rust)
+
 Danish is an experiment in middle-box DANE (RFC 6698) for HTTPS.
 
 Danish is a daemon that listens for HTTPS TLS handshake traffic and captures the TLS/SNI and certificates. It then performs DNS lookups for DNS TLSA records to determine if the responding server is sending the correct X.509 certificate in its TLS ServerHello message.
