@@ -69,6 +69,7 @@ fn main() {
             }
         }
     }
+    drop(cli_opts);
 
     // ACL clean up thread
     let acl_clean_thr = thread::Builder::new().name("acl_clean".to_string()).spawn(move || {
