@@ -2,6 +2,12 @@
 Copyright (c) 2019, Andrew McConachie <andrew@depht.com>
 All rights reserved.
 */
+use std::time::Duration;
+use pcap::Device;
+use etherparse::PacketHeaders;
+use etherparse::IpHeader::*;
+use etherparse::TransportHeader::*;
+use ipaddress::{ipv4, ipv6};
 
 include!("lib.rs");
 
@@ -27,8 +33,10 @@ fn main() {
     let server_cache_v4 = Arc::new(RwLock::new(HashMap::<String, ServerCacheEntry>::new())); // server_4_thr
     let server_cache_v6 = Arc::new(RwLock::new(HashMap::<String, ServerCacheEntry>::new())); // server_6_thr
 
-    let acl_cache_v4 = Arc::new(RwLock::new(HashMap::<String, AclCacheEntry>::new())); // server_4_thr
-    let acl_cache_v6 = Arc::clone(&acl_cache_v4); // server_6_thr
+    let acl_cache_v4 = Arc::new(RwLock::new(HashMap::<String, AclCacheEntry>::new())); // client_4_thr
+    let acl_cache_v6 = Arc::clone(&acl_cache_v4); // client_6_thr
+    let acl_cache_v4_srv = Arc::clone(&acl_cache_v4); // server_4_thr
+    let acl_cache_v6_srv = Arc::clone(&acl_cache_v4); // server_6_thr
     let acl_cache_clean = Arc::clone(&acl_cache_v4); // acl_clean_thr
 
     // Check our input
@@ -166,7 +174,7 @@ fn main() {
             drop(stale);
 
             let pkt = PacketHeaders::from_ethernet_slice(&packet).expect("Failed to decode packet in client_4_thr");
-            //debug!("Everything: {:?}", pkt);
+            debug!("Everything: {:?}", pkt);
 
             match pkt.ip.unwrap() {
                 Version6(_) => {
@@ -197,9 +205,13 @@ fn main() {
                                             sni: sni.clone(),
                                             tlsa: None,
                                             response: false,
+                                            rpz_blocked: false,
                                             stale: false,
                                         });
                                     dns_lookup_tlsa(Arc::clone(&client_cache_v4), key.clone());
+                                    if Opt::from_args().rpz {
+                                        handle_rpz(Arc::clone(&acl_cache_v4), Arc::clone(&client_cache_v4), key.clone());
+                                    }
                                 }
                             }
                         }
@@ -260,7 +272,7 @@ fn main() {
                         Tcp(tcp) => {
                             //debug!("resp_tcp_seq: {:?}", tcp.sequence_number);
                             //debug!("payload_len: {:?}", pkt.payload.len());
-                            parse_server_hello(&acl_cache_v4, &client_cache_v4_srv, &server_cache_v4,
+                            parse_server_hello(&acl_cache_v4_srv, &client_cache_v4_srv, &server_cache_v4,
                                                ipv4::new(ipv4_display(&ipv4.source)).unwrap(),
                                                ipv4::new(ipv4_display(&ipv4.destination)).unwrap(),
                                                tcp, pkt.payload);
@@ -331,9 +343,13 @@ fn main() {
                                                     sni: sni.clone(),
                                                     tlsa: None,
                                                     response: false,
+                                                    rpz_blocked: false,
                                                     stale: false,
                                                 });
                                                 dns_lookup_tlsa(Arc::clone(&client_cache_v6), key.clone());
+                                                if Opt::from_args().rpz {
+                                                    handle_rpz(Arc::clone(&acl_cache_v6), Arc::clone(&client_cache_v6), key.clone());
+                                                }
                                             }
                                         }
                                     }
@@ -397,7 +413,7 @@ fn main() {
                                 //debug!("payload_len: {:?}", pkt.payload.len());
                                 if pkt.payload.len() > 0 {
                                     if tcp.ack && !tcp.rst && !tcp.syn && !tcp.fin {
-                                        parse_server_hello(&acl_cache_v6, &client_cache_v6_srv, &server_cache_v6,
+                                        parse_server_hello(&acl_cache_v6_srv, &client_cache_v6_srv, &server_cache_v6,
                                                            ipv6::new(ipv6_display(&ipv6.source)).unwrap(),
                                                            ipv6::new(ipv6_display(&ipv6.destination)).unwrap(),
                                                            tcp, pkt.payload);

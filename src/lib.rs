@@ -7,14 +7,10 @@ All rights reserved.
 extern crate log;
 
 use std::{iter, time, thread};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use pcap::Device;
-use etherparse::PacketHeaders;
-use etherparse::IpHeader::*;
-use etherparse::TransportHeader::*;
 use tls_parser::tls;
 use tls_parser::tls_extensions;
 use resolv::{Resolver, Class, RecordType};
@@ -25,7 +21,7 @@ use sha2::{Sha256, Sha512, Digest};
 use iptables;
 use x509_parser;
 use simpath::Simpath;
-use ipaddress::{ipv4, ipv6};
+use ipaddress;
 use structopt::StructOpt;
 
 // CONSTANTS
@@ -64,6 +60,7 @@ struct ClientCacheEntry { // Key in hashmap is from derive_cache_key()
     sni: String, // SNI
     tlsa: Option<Vec<TLSA>>, // DNS TLSA RRSET
     response: bool, // Have we queried and gotten a response yet?
+    rpz_blocked: bool, // True if RPZ checking failed and ACL was installed
     stale: bool, // Entry can be deleted at next cleanup
 }
 
@@ -89,6 +86,9 @@ struct Opt {
     /// iptables/ip6tables top chain
     #[structopt(short = "c", long = "chain", default_value = "OUTPUT")]
     chain: String,
+    /// enable RPZ operation
+    #[structopt(short = "r", long = "rpz")]
+    rpz: bool,
     /// iptables/ip6tables sub-chain for ACLs
     #[structopt(short = "s", long = "sub-chain", default_value = "danish")]
     sub_chain: String,
@@ -151,7 +151,7 @@ fn parse_server_hello(acl_cache: &Arc<RwLock<HashMap::<String, AclCacheEntry>>>,
                       tcp_header: etherparse::TcpHeader, payload: &[u8]) {
 
     let key = derive_cache_key(&ip_dst, &ip_src, &tcp_header.destination_port);
-    let client_seen = client_cache.read().contains_key(&key);
+    let client_seen = client_cache.read().contains_key(&key) && !client_cache.read().get(&key).unwrap().stale;
     if client_seen {
         //debug!("Found client_cache key {:?}", key);
 
@@ -243,12 +243,66 @@ fn parse_server_hello(acl_cache: &Arc<RwLock<HashMap::<String, AclCacheEntry>>>,
     }
 }
 
+// Perform DNS A/AAAA lookup for RPZ and update client_cache
+fn handle_rpz(acl_cache: Arc<RwLock<HashMap::<String, AclCacheEntry>>>,
+              client_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>, key: String) {
+
+    thread::spawn(move || {
+        let sni = client_cache.read().get(&key).unwrap().sni.clone();
+        let mut resolver = Resolver::new().unwrap();
+        match resolver.query(&sni.clone().into_bytes(), Class::IN, RecordType::A) {
+            Ok(_) => { },
+            Err(_) => {
+                match resolver.query(&sni.clone().into_bytes(), Class::IN, RecordType::AAAA) {
+                    Ok(_) => { },
+                    Err(_) => {
+                        if let Some(cl_entry) = client_cache.write().get_mut(&key) {
+                            for (_key, acl_entry) in acl_cache.read().iter() {
+                                if acl_entry.sni == cl_entry.sni {
+                                    return; // ACL already exists
+                                }
+                            }
+                            cl_entry.rpz_blocked = true;
+                            cl_entry.stale = true;
+                            cl_entry.ts = SystemTime::now();
+
+                            let chain = unique_chain_name(&sni);
+                            match iptables::new(false) { // Create iptables chain and insert ACL
+                                Err(err) => panic!("Fatal iptables error {:?}", err),
+                                Ok(ipt) => {
+                                    ipt_add_long(&ipt, &chain, &sni).expect("Fatal iptables error at add_long for rpz");
+                                }
+                            }
+                            if ipv6_enabled() {
+                                match iptables::new(true) { // Create ip6tables chain and insert ACL
+                                    Err(err) => panic!("Fatal ip6tables error {:?}", err),
+                                    Ok(ipt6) => {
+                                        ipt_add_long(&ipt6, &chain, &sni).expect("Fatal ip6tables error at add_long for rpz");
+                                    }
+                                }
+                            }
+                            debug!("Inserting new acl_cache entry {:?}", chain);
+                            acl_cache.write().insert(chain, AclCacheEntry {
+                                ts: SystemTime::now(),
+                                insert_ts: SystemTime::now(),
+                                sni: sni.clone(),
+                                short_active: false,
+                                short_ipv4: false,
+                            });
+                        } else {
+                            panic!("Failed to update client_cache");
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
 
 // Perform DNS TLSA lookup and update client_cache
 fn dns_lookup_tlsa(client_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>, key: String) {
     thread::spawn(move || {
         let qname = "_443._tcp.".to_owned() + &client_cache.read().get(&key).unwrap().sni.clone();
-
         let mut resolver = Resolver::new().unwrap();
         match resolver.query(&qname.into_bytes(), Class::IN, RecordType::TLSA) {
             Ok(mut response) => {
@@ -295,7 +349,7 @@ fn handle_validation(acl_cache: Arc<RwLock<HashMap<String, AclCacheEntry>>>,
                         }else{
                             debug!("Invalid TLSA for {:?}", sni);
                             let chain = unique_chain_name(&sni);
-                            match iptables::new(false) { // Create iptables chains and insert ACLs
+                            match iptables::new(false) { // Create iptables chain and insert ACLs
                                 Err(err) => panic!("Fatal iptables error {:?}", err),
                                 Ok(ipt) => {
                                     ipt_add_chain(&ipt, &chain).expect("Fatal iptables error at add_chain");
@@ -306,7 +360,7 @@ fn handle_validation(acl_cache: Arc<RwLock<HashMap<String, AclCacheEntry>>>,
                                 }
                             }
                             if ipv6_enabled() {
-                                match iptables::new(true) { // Create ip6tables chains and insert ACLs
+                                match iptables::new(true) { // Create ip6tables chain and insert ACLs
                                     Err(err) => panic!("Fatal ip6tables error {:?}", err),
                                     Ok(ipt6) => {
                                         ipt_add_chain(&ipt6, &chain).expect("Fatal ip6tables error at add_chain");
