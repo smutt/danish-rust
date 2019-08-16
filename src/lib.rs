@@ -86,6 +86,9 @@ struct Opt {
     /// iptables/ip6tables top chain
     #[structopt(short = "c", long = "chain", default_value = "OUTPUT")]
     chain: String,
+    /// pcap interface to listen on, typically a network interface
+    #[structopt(short = "i", long = "interface", default_value = "eth0")]
+    iface: String,
     /// enable RPZ operation
     #[structopt(short = "r", long = "rpz")]
     rpz: bool,
