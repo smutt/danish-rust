@@ -43,8 +43,16 @@ compilation.**
  and FORWARD. Use OUTPUT to run danish in host mode and FORWARD to run
  danish in middlebox mode. Default value is OUTPUT.
 
+**-i, --interface**
+pcap interface to listen on, typically the network interface with the
+default route. Default value is eth0.
+
 **-h, --help**
 display help and exit
+
+**-r, --rpz**
+Enable Response Policy Zones(RPZ) operation. If enabled danish will
+block any SNI that fails resolution for A and AAAA. Default value is disabled.
 
 **-s, --sub-chain**
 iptables/ip6tables sub-chain for installing ACLs. Special chain used
