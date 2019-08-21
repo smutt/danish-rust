@@ -5,6 +5,8 @@ import os
 import re
 import fileinput
 
+# Rust code to produce debug output. Send to stdin of this script.
+# debug!("hex {:?}", payload.iter().map(|h| format!("{:X}", h)).collect::<Vec<_>>());
 
 # Takes a list of character nibbles
 # Prints them in pretty nibble hex format

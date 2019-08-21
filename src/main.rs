@@ -53,6 +53,7 @@ const IPV6TABLES_DIRS: [&str; 6] = ["/bin", "/sbin", "/usr/bin", "/usr/sbin", "/
 enum CertParseError {
     IncompleteTlsRecord,
     WrongTlsRecord,
+    UnsupportedVersion,
 }
 
 // Types of errors we can generate from parse_sni()
@@ -62,6 +63,7 @@ enum SniParseError {
     ClientHelloNotFound,
     IncorrectMsgType,
     PayloadParsing,
+    UnsupportedVersion,
     General,
 }
 
@@ -116,39 +118,15 @@ struct Opt {
 // TLS FUNCTIONS //
 ///////////////////
 // TODO get stricter about the kinds of TLS packets we accept. crib from the python
-// Parse the X.509 cert from TLS ServerHello Messages
-// Recursively call parse_tls_plaintext() until we find the TLS Certificate Record or Error
-fn parse_cert(payload: &[u8]) -> Result<Vec<Vec<u8>>, CertParseError> {
-    //debug!("Entered parse_cert() payload.len: {:?}", payload.len());
-    //debug!("hex {:?}", payload.iter().map(|h| format!("{:X}", h)).collect::<Vec<_>>());
-    match tls::parse_tls_plaintext(payload) {
-        Ok(plaintext) => {
-            for msg in plaintext.1.msg.iter() {
-                match msg {
-                    tls::TlsMessage::Handshake(ref handshake) => {
-                        //debug!("parse_cert>handshake: {:?}", handshake);
-                        match handshake {
-                            tls::TlsMessageHandshake::Certificate(ref cert_record) => {
-                                return Ok(cert_record.cert_chain.iter().map(|c| c.data.to_vec()).collect::<Vec<_>>());
-                            }
-                            _ => return parse_cert(&plaintext.0),
-                        }
-                    }
-                    _ => return parse_cert(&plaintext.0),
-                }
-            }
-            return Err(CertParseError::WrongTlsRecord);
-        }
-        _ => return Err(CertParseError::IncompleteTlsRecord),
-    }
-}
-
-// TODO get stricter about the kinds of TLS packets we accept. crib from the python
 // Parse out the SNI from passed TLS payload
 fn parse_sni(payload: &[u8]) -> Result<String, SniParseError> {
     match tls::parse_tls_plaintext(payload) {
-        Ok(value) => {
-            match value.1.msg[0] { // TODO Problematic because we don't iterate through all messages
+        Ok(plaintext) => {
+            if !(plaintext.1.hdr.version == tls::TlsVersion::Tls10 ||
+                 plaintext.1.hdr.version == tls::TlsVersion::Tls11 || plaintext.1.hdr.version == tls::TlsVersion::Tls12) {
+                return Err(SniParseError::UnsupportedVersion);
+            }
+            match plaintext.1.msg[0] { // TODO Problematic because we don't iterate through all messages
                 tls::TlsMessage::Handshake(ref handshake) => {
                     match handshake {
                         tls::TlsMessageHandshake::ClientHello(ref ch) => {
@@ -177,6 +155,36 @@ fn parse_sni(payload: &[u8]) -> Result<String, SniParseError> {
     Err(SniParseError::General)
 }
 
+// TODO get stricter about the kinds of TLS packets we accept. crib from the python
+// Parse the X.509 cert from TLS ServerHello Messages
+// Recursively call parse_tls_plaintext() until we find the TLS Certificate Record or Error
+fn parse_cert(payload: &[u8]) -> Result<Vec<Vec<u8>>, CertParseError> {
+    match tls::parse_tls_plaintext(payload) {
+        Ok(plaintext) => {
+            if !(plaintext.1.hdr.version == tls::TlsVersion::Tls10 ||
+                 plaintext.1.hdr.version == tls::TlsVersion::Tls11 || plaintext.1.hdr.version == tls::TlsVersion::Tls12) {
+                return Err(CertParseError::UnsupportedVersion);
+            }
+            for msg in plaintext.1.msg.iter() {
+                match msg {
+                    tls::TlsMessage::Handshake(ref handshake) => {
+                        //debug!("parse_cert>handshake: {:?}", handshake);
+                        match handshake {
+                            tls::TlsMessageHandshake::Certificate(ref cert_record) => {
+                                return Ok(cert_record.cert_chain.iter().map(|c| c.data.to_vec()).collect::<Vec<_>>());
+                            }
+                            _ => return parse_cert(&plaintext.0),
+                        }
+                    }
+                    _ => return parse_cert(&plaintext.0),
+                }
+            }
+            return Err(CertParseError::WrongTlsRecord);
+        }
+        _ => return Err(CertParseError::IncompleteTlsRecord),
+    }
+}
+
 // Parse TLS server hello for both IPv4 and IPv6
 fn parse_server_hello(acl_cache: &Arc<RwLock<HashMap::<String, AclCacheEntry>>>,
                       client_cache: &Arc<RwLock<HashMap<String, ClientCacheEntry>>>,
@@ -193,13 +201,12 @@ fn parse_server_hello(acl_cache: &Arc<RwLock<HashMap::<String, AclCacheEntry>>>,
         It will also likely span multiple TCP packets. Thus we need to test every payload
         received to see if it is complete, if not we need to store it until we get the
         next segment and test completeness again. If it is complete, but still not a
-        Certificate TLS message we need to flush cache and start waiting again. */
+        Certificate TLS message we need to mark the cache entry as stale and start waiting again. */
 
         let server_seen = server_cache.read().contains_key(&key);
         if server_seen {
             if let Some(entry) = server_cache.write().get_mut(&key) {
                 if entry.stale {
-                    //debug!("Ignoring server_cache key {:?}", key);
                     return
                 }
 
@@ -232,6 +239,13 @@ fn parse_server_hello(acl_cache: &Arc<RwLock<HashMap::<String, AclCacheEntry>>>,
                                 }else{
                                     debug!("Out-of-order TCP datagrams detected {:?}", key); // TODO: This error doesn't tell the whole story
                                 }
+                            }
+                            CertParseError::UnsupportedVersion => {
+                                debug!("Unsupported TLS version in ServerHello");
+                                entry.ts = SystemTime::now();
+                                entry.seq = None;
+                                entry.data = None;
+                                entry.stale = true;
                             }
                         }
                     }
@@ -267,6 +281,9 @@ fn parse_server_hello(acl_cache: &Arc<RwLock<HashMap::<String, AclCacheEntry>>>,
                                 data: Some(payload.to_vec()),
                                 stale: false,
                             });
+                        }
+                        CertParseError::UnsupportedVersion => {
+                            debug!("Unsupported TLS version in ServerHello");
                         }
                     }
                 }
@@ -947,6 +964,8 @@ fn main() {
                                     match err {
                                         SniParseError::ClientHelloNotFound | SniParseError::IncorrectMsgType =>
                                             debug!("SNI not found in pkt, likely not TLS ClientHello"),
+                                        SniParseError::UnsupportedVersion =>
+                                            debug!("Unsupported TLS version in ClientHello"),
                                         _ => error!("Error parsing SNI"),
                                     }
                                 }
@@ -1086,6 +1105,8 @@ fn main() {
                                                 match err {
                                                     SniParseError::ClientHelloNotFound | SniParseError::IncorrectMsgType =>
                                                         debug!("SNI not found in pkt, likely not TLS ClientHello"),
+                                                    SniParseError::UnsupportedVersion =>
+                                                        debug!("Unsupported TLS version in ClientHello"),
                                                     _ => error!("Error parsing SNI"),
                                                 }
                                             }
