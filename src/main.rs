@@ -281,6 +281,7 @@ fn parse_server_hello(acl_cache: &Arc<RwLock<HashMap::<String, AclCacheEntry>>>,
 // DNS FUNCTIONS //
 ///////////////////
 // Perform DNS TLSA lookup and update client_cache
+// TODO: Rewrite using async/await once it's final
 fn dns_lookup_tlsa(client_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>, key: String) {
     thread::spawn(move || {
         let qname = "_443._tcp.".to_owned() + &client_cache.read().get(&key).unwrap().sni.clone();
@@ -314,6 +315,7 @@ fn dns_lookup_tlsa(client_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>,
 //////////////////////////
 // Kicks off TLSA validation thread once X.509 cert has been received
 // Determines validation disposition and installs ACLs if necessary
+// TODO: Rewrite using async/await once it's final
 fn handle_validation(acl_cache: Arc<RwLock<HashMap<String, AclCacheEntry>>>,
                      cl_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>,
                      cert_chain: Vec<Vec<u8>>, src: ipaddress::IPAddress, dst: ipaddress::IPAddress, port: u16) {
@@ -497,6 +499,7 @@ fn validate_tlsa(tlsa_rrset: &Vec<TLSA>, cert_chain: &Vec<Vec<u8>>) -> bool {
 }
 
 // Perform DNS A/AAAA lookup for RPZ and update client_cache
+// TODO: Rewrite using async/await once it's final
 fn handle_rpz(acl_cache: Arc<RwLock<HashMap::<String, AclCacheEntry>>>,
               client_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>, key: String) {
 
