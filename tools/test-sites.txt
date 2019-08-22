@@ -1,0 +1,23 @@
+# HTTPS DANE ENABLED SITES
+www.middlebox-dane.org
+bad.middlebox-dane.org
+www.metafarce.com
+www.freebsd.org
+access.ripe.net
+digid.nl
+frobbit.se
+mijnoverheid.nl
+mijn.overheid.nl
+overheid.nl
+www.defcon.org
+posteo.de
+sys4.de
+
+# NON-DANE ENABLED SITES
+news.ycombinator.com
+www.amazon.com
+www.nu.nl
+www.google.com
+cnn.com
+facebook.com
+
