@@ -7,17 +7,12 @@ import sys
 import os
 import urllib.request
 import argparse
-import ssl
 import socket
 import dns.resolver
 import hashlib
 from Crypto.Util.asn1 import DerSequence
-
-#############
-# CONSTANTS #
-#############
-
-HTTPS_TIMEOUT = 10 # Timeout for each HTTP GET in seconds
+from OpenSSL import SSL
+from OpenSSL import crypto
 
 ####################
 # GLOBAL FUNCTIONS #
@@ -39,28 +34,28 @@ def fetch_index(host):
   else:
     return True
 
-# https://stackoverflow.com/questions/7689941/how-can-i-retrieve-the-tls-ssl-peer-certificate-of-a-remote-host-using-python
+# https://stackoverflow.com/questions/51039393/get-or-build-pem-certificate-chain-in-python
 # TODO: Need to return the whole certificate chain and not just one
 def get_certs(host, port=443):
-  bad_host = False
-  context = ssl.create_default_context()
-  context.verify_mode = ssl.CERT_REQUIRED
-  context.check_hostname = True
-  conn = socket.create_connection((host, port))
-  sock = context.wrap_socket(conn, server_hostname=host)
-  sock.settimeout(HTTPS_TIMEOUT)
-
+  certs = []
   try:
-    der_cert = sock.getpeercert(True)
+    ctx = SSL.Context(SSL.SSLv23_METHOD)
+    sock = socket.create_connection((host, port))
+    tls = SSL.Connection(ctx, sock)
+    tls.set_connect_state()
+    tls.set_tlsext_host_name(host.encode())
+    tls.sendall(b'HEAD / HTTP/1.0\n\n')
+    while tls.get_peer_finished() == None or tls.get_finished() == None:
+      pass
+
+    certs = tls.get_peer_cert_chain()
   except:
-    bad_host = True
+    sock.close()
+    return certs
   finally:
     sock.close()
 
-  if bad_host:
-    return False
-  else:
-    return [der_cert]
+  return [crypto.dump_certificate(crypto.FILETYPE_ASN1, cert) for cert in certs]
 
 def get_a(host):
   d = dns.resolver.Resolver()
@@ -126,19 +121,18 @@ def validate(certs, tlsa_rrs, verbose=False):
   }
 
   for tlsa in tlsa_rrs:
-    if tlsa['usage'] == 0 or tlsa['usage'] == 2: # Trust Anchor, won't work without whole chain
-      print("TLSA usage 0 2 not supported")
+    if tlsa['usage'] == 0 or tlsa['usage'] == 2: # Trust Anchor
       if tlsa['selector'] == 0:
-        if tlsa['data'] == mTypes[tlsa['mtype']](certs[0]).digest().hex():
+        if tlsa['data'] == mTypes[tlsa['mtype']](certs[-1]).digest().hex():
           return True
       else:
-        pub_key = extract_pub_key(certs[0])
+        pub_key = extract_pub_key(certs[-1])
         if tlsa['data'] == mTypes[tlsa['mtype']](pub_key).digest().hex():
           return True
 
     elif tlsa['usage'] == 1 or tlsa['usage'] == 3: # End Entity
       if tlsa['selector'] == 0:
-        if tlsa['data'] == mTypes[tlsa['mtype']](certs[-1]).digest().hex():
+        if tlsa['data'] == mTypes[tlsa['mtype']](certs[0]).digest().hex():
           return True
       else:
         pub_key = extract_pub_key(certs[0])
@@ -172,12 +166,15 @@ if fetch_index(dom):
 else:
   print("Failed fetching https://" + dom + "/index.html")
 
-certs = get_certs(args.domain[0].strip())
-if certs == False:
-  print("No valid certificate found for " + dom)
+if args.verbose:
+  print("Fetching certificate chain for " + dom)
+certs = get_certs(dom)
+
+if len(certs) == 0:
+  print("No certificates found for " + dom)
   sys.exit(0)
 
-tlsa_rrs = get_tlsa(args.domain[0].strip())
+tlsa_rrs = get_tlsa(dom)
 if tlsa_rrs:
   if args.verbose:
     print("TLSA RRs found for " + dom)
@@ -190,6 +187,5 @@ if tlsa_rrs:
 
 else:
   print("No TLSA for " + dom)
-
 
 sys.exit(0)
