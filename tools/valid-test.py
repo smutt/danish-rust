@@ -5,23 +5,19 @@
 
 import sys
 import os
-#import random
 import urllib.request
-#import time
 import argparse
 import ssl
 import socket
-#import OpenSSL
 import dns.resolver
 import hashlib
-import subprocess
+from Crypto.Util.asn1 import DerSequence
 
 #############
 # CONSTANTS #
 #############
 
 HTTPS_TIMEOUT = 10 # Timeout for each HTTP GET in seconds
-TMP_FILE = 'valid-test.tmp' # Temporary filename used for multiple things
 
 ####################
 # GLOBAL FUNCTIONS #
@@ -64,7 +60,6 @@ def get_certs(host, port=443):
   if bad_host:
     return False
   else:
-    #return ssl.DER_cert_to_PEM_cert(der_cert)
     return [der_cert]
 
 def get_a(host):
@@ -115,15 +110,13 @@ def get_tlsa(host, port=443, trans='tcp'):
 def dummy(x):
   return x
 
-# openssl x509 -pubkey -noout -in cert.pem
-def extract_pub_key(cert):
-  fd = open(TMP_FILE, 'w')
-  fd.write(ssl.DER_cert_to_PEM_cert(cert))
-  fd.close()
-  s = '/usr/bin/openssl x509 -pubkey -noout -in ' + TMP_FILE
-  pem_key = str(subprocess.check_output(s.split(), timeout=10, stderr=subprocess.STDOUT))
-  os.remove(TMP_FILE)
-  return pem_key.split("-----BEGIN PUBLIC KEY-----")[1].split("-----END PUBLIC KEY-----")[0].strip()
+# https://stackoverflow.com/questions/12911373/how-do-i-use-a-x509-certificate-with-pycrypto
+def extract_pub_key(der):
+  cert = DerSequence()
+  cert.decode(der)
+  tbsCertificate = DerSequence()
+  tbsCertificate.decode(cert[0])
+  return tbsCertificate[6]
 
 def validate(certs, tlsa_rrs, verbose=False):
   mTypes = {
@@ -133,11 +126,8 @@ def validate(certs, tlsa_rrs, verbose=False):
   }
 
   for tlsa in tlsa_rrs:
-    if tlsa['selector'] == 1: # TODO: Implement this
-      print("TLSA Selector 1 currently unsupported")
-      #exit(1)
-
     if tlsa['usage'] == 0 or tlsa['usage'] == 2: # Trust Anchor, won't work without whole chain
+      print("TLSA usage 0 2 not supported")
       if tlsa['selector'] == 0:
         if tlsa['data'] == mTypes[tlsa['mtype']](certs[0]).digest().hex():
           return True
@@ -151,7 +141,6 @@ def validate(certs, tlsa_rrs, verbose=False):
         if tlsa['data'] == mTypes[tlsa['mtype']](certs[-1]).digest().hex():
           return True
       else:
-        print(extract_pub_key(certs[0]))
         pub_key = extract_pub_key(certs[0])
         if tlsa['data'] == mTypes[tlsa['mtype']](pub_key).digest().hex():
           return True
