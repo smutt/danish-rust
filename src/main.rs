@@ -416,18 +416,16 @@ fn handle_validation(acl_cache: Arc<RwLock<HashMap<String, AclCacheEntry>>>,
 // Returns True on valid and False on invalid
 fn validate_tlsa(tlsa_rrset: &Vec<TLSA>, cert_chain: &Vec<Vec<u8>>) -> bool {
     //debug!("Entered validate_tlsa() tlsa_rrset: {:?}", tlsa_rrset);
-    let mut certs: Vec<Vec<u8>>;
     for tlsa in tlsa_rrset {
-        //debug!("tlsa: {:?}", tlsa);
+        let mut certs: Vec<Vec<u8>> = cert_chain.clone();
         match tlsa.selector {
-            0 => certs = cert_chain.clone(),
+            0 => {},
             1 => {
-                certs = cert_chain.clone(); // TODO: remove these lines when I'm better at rust
                 certs.clear();
                 for cc in cert_chain.iter() {
                     match x509_parser::parse_subject_public_key_info(cc) {
                         Err(err) => {
-                            warn!("Error parsing SPKI from X.509 record {:?} \n {:?}", err, cc);
+                            warn!("Error parsing SPKI from X.509 record {:?}", err);
                             return true; // Do no harm
                         }
                         Ok(spki) => {
