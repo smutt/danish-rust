@@ -111,6 +111,12 @@ def extract_pub_key(der):
   cert.decode(der)
   tbsCertificate = DerSequence()
   tbsCertificate.decode(cert[0])
+  if args.very_verbose:
+    ss = ''
+    for byte in tbsCertificate[6]:
+      ss += str(byte) + ' '
+    print("FULL SPKI")
+    print("[ " + ss + "]")
   return tbsCertificate[6]
 
 def validate(certs, tlsa_rrs, verbose=False):
@@ -148,7 +154,8 @@ def validate(certs, tlsa_rrs, verbose=False):
 
 ap = argparse.ArgumentParser(description='Test HTTPS DANE validation for a domain')
 ap.add_argument('domain', nargs=1, help='Domain under test')
-ap.add_argument('-v', '--verbose', action='store_true', dest='verbose', help='Verbose operation')
+ap.add_argument('-v', '--verbose', action='store_true', dest='verbose', help='Verbose output')
+ap.add_argument('-vv', '--very_verbose', action='store_true', dest='very_verbose', help='Very Verbose output')
 args = ap.parse_args()
 
 dom = args.domain[0].strip()
