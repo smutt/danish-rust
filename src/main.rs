@@ -6,8 +6,7 @@ All rights reserved.
 //////////////
 // INCLUDES //
 //////////////
-#[macro_use]
-extern crate log;
+#[macro_use] extern crate log;
 use std::{iter, time, thread};
 use std::time::{Duration, SystemTime};
 use std::sync::Arc;
@@ -25,10 +24,10 @@ use etherparse::PacketHeaders;
 use etherparse::IpHeader::*;
 use etherparse::TransportHeader::*;
 use iptables;
-use x509_parser;
 use simpath::Simpath;
 use ipaddress::{ipv4, ipv6};
 use structopt::StructOpt;
+use openssl::x509::X509;
 
 ///////////////
 // CONSTANTS //
@@ -423,13 +422,27 @@ fn validate_tlsa(tlsa_rrset: &Vec<TLSA>, cert_chain: &Vec<Vec<u8>>) -> bool {
             1 => {
                 certs.clear();
                 for cc in cert_chain.iter() {
-                    match x509_parser::parse_subject_public_key_info(cc) {
+                    match X509::from_der(&cc) {
                         Err(err) => {
-                            warn!("Error parsing SPKI from X.509 record {:?}", err);
+                            error!("Error parsing x509 from DER {:?}", err);
                             return true; // Do no harm
-                        }
-                        Ok(spki) => {
-                            certs.push(spki.1.subject_public_key.data.to_vec());
+                        },
+                        Ok(x509) => {
+                            match x509.public_key() {
+                                Err(err) => {
+                                    error!("Error parsing SPKI from x509 {:?}", err);
+                                    return true; // Do no harm
+                                }
+                                Ok(pkey) => {
+                                    match pkey.public_key_to_der() {
+                                        Err(err) => {
+                                            error!("Error serializing SPKI to DER {:?}", err);
+                                            return true; // Do no harm
+                                        },
+                                        Ok(der_pkey) => certs.push(der_pkey),
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -616,8 +629,6 @@ fn ipt_add_long(ipt: &iptables::IPTables, chain: &String, sni: &String) -> Resul
     let ext_len: String = format!("{:01$x}", sni.len() + 3, 4);
     let ent_len: String = format!("{:01$x}", sni.len() + 5, 4);
     let pattern = format!("{}{}{}{}{}{}{}", "|0000", ent_len, ext_len, "00", sni_len, &hex_sni, "|");
-    debug!("pattern {:?}", pattern);
-
     let long_egress =  format!("{}{}{}{}{}", "-p tcp --dport 443 -m string --algo bm --hex-string '",
                                &pattern, "' -m comment --comment ", &sni, " -j DROP");
     debug!("long_egress: {:?}", long_egress);
