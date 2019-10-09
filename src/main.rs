@@ -955,7 +955,10 @@ fn main() {
 
     let client_4_thr = thread::Builder::new().name("client_4".to_string()).spawn(move || {
         let bpf_client_4 = "(tcp[((tcp[12:1] & 0xf0) >> 2)+5:1] = 0x01) and (tcp[((tcp[12:1] & 0xf0) >> 2):1] = 0x16) and (dst port 443)";
-        let mut capture = Capture::from_device(Opt::from_args().iface.as_str()).unwrap().open().unwrap();
+        let mut capture = Capture::from_device(Opt::from_args().iface.as_str()).unwrap()
+            .promisc(true)
+            .rfmon(false)
+            .open().unwrap();
         match capture.filter(bpf_client_4){
             Ok(_) => (),
             Err(err) => error!("BPF error {}", err.to_string()),
@@ -1033,7 +1036,10 @@ fn main() {
         let bpf_server_4 = "tcp and src port 443 and (tcp[tcpflags] & tcp-ack = 16) and (tcp[tcpflags] & tcp-syn != 2) and 
         (tcp[tcpflags] & tcp-fin != 1) and (tcp[tcpflags] & tcp-rst != 1)";
 
-        let mut capture = Capture::from_device(Opt::from_args().iface.as_str()).unwrap().open().unwrap();
+        let mut capture = Capture::from_device(Opt::from_args().iface.as_str()).unwrap()
+            .promisc(true)
+            .rfmon(false)
+            .open().unwrap();
         match capture.filter(bpf_server_4){
             Ok(_) => (),
             Err(err) => error!("BPF error {}", err.to_string()),
@@ -1094,7 +1100,10 @@ fn main() {
     if ipv6_enabled() {
         let client_6_thr = thread::Builder::new().name("client_6".to_string()).spawn(move || {
             let bpf_client_6 = "ip6 and tcp and dst port 443";
-            let mut capture = Capture::from_device(Opt::from_args().iface.as_str()).unwrap().open().unwrap();
+            let mut capture = Capture::from_device(Opt::from_args().iface.as_str()).unwrap()
+            .promisc(true)
+            .rfmon(false)
+            .open().unwrap();
             match capture.filter(bpf_client_6){
                 Ok(_) => (),
                 Err(err) => error!("BPF error {}", err.to_string()),
@@ -1174,7 +1183,10 @@ fn main() {
         let server_6_thr = thread::Builder::new().name("server_6".to_string()).spawn(move || {
             let bpf_server_6 = "ip6 and tcp and src port 443";
 
-            let mut capture = Capture::from_device(Opt::from_args().iface.as_str()).unwrap().open().unwrap();
+            let mut capture = Capture::from_device(Opt::from_args().iface.as_str()).unwrap()
+                .promisc(true)
+                .rfmon(false)
+                .open().unwrap();
             match capture.filter(bpf_server_6){
                 Ok(_) => (),
                 Err(err) => error!("BPF error {}", err.to_string()),
