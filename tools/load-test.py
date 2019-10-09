@@ -16,6 +16,7 @@ import time
 
 DYING = False # Set to True when a kill signal has been received
 HTTP_TIMEOUT = 10 # Timeout for each HTTP GET in seconds
+DELAY = 1 # Delay in seconds between each thread launch
 SLEEP_CYCLE = 30 # How many seconds we sleep between each top-level iteration 
 MAX_THREADS = 50 # Maximum number of threads permitted to be active
 
@@ -102,6 +103,7 @@ while True:
   for st in sites:
     if DYING:
       break
+    time.sleep(DELAY)
     UrlThr(st).start()
   time.sleep(SLEEP_CYCLE)
 
