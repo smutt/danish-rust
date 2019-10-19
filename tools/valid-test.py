@@ -14,10 +14,32 @@ from Crypto.Util.asn1 import DerSequence
 from OpenSSL import SSL
 from OpenSSL import crypto
 
+###########
+# CLASSES #
+###########
+class Dummy: # A class full of dummies
+  def __init__(self, y):
+    self.x = y
+
+  def dummy(self):
+    return self.x
+
+  def hexdigest(self):
+    return ''.join([hex(byte).split('0x')[1] for byte in self.x])
+
+#############
+# CONSTANTS #
+#############
+HTTPS_TIMEOUT = 10 # Timeout in seconds for HTTPS GET
+MTYPES = { # Possible RFC 6698 matching types
+  0: Dummy,
+  1: hashlib.sha256,
+  2: hashlib.sha512
+}
+
 ####################
 # GLOBAL FUNCTIONS #
 ####################
-
 def fetch_index(host):
   try:
     urllib.request.urlopen("https://" + host + "/index.html", timeout=HTTPS_TIMEOUT)
@@ -102,9 +124,6 @@ def get_tlsa(host, port=443, trans='tcp'):
       rv.append(rec)
     return rv
 
-def dummy(x):
-  return x
-
 # https://stackoverflow.com/questions/12911373/how-do-i-use-a-x509-certificate-with-pycrypto
 def extract_pub_key(der):
   cert = DerSequence()
@@ -117,37 +136,48 @@ def extract_pub_key(der):
       ss += str(byte) + ' '
     print("FULL SPKI")
     print("[ " + ss + "]")
+
   return tbsCertificate[6]
 
 def validate(certs, tlsa_rrs, verbose=False):
-  mTypes = {
-    0: dummy,
-    1: hashlib.sha256,
-    2: hashlib.sha512
-  }
-
   for tlsa in tlsa_rrs:
     if tlsa['usage'] == 0 or tlsa['usage'] == 2: # Trust Anchor
       if tlsa['selector'] == 0:
-        if tlsa['data'] == mTypes[tlsa['mtype']](certs[-1]).digest().hex():
+        if tlsa['data'] == MTYPES[tlsa['mtype']](certs[-1]).hexdigest():
           return True
       else:
         pub_key = extract_pub_key(certs[-1])
-        if tlsa['data'] == mTypes[tlsa['mtype']](pub_key).digest().hex():
+        if tlsa['data'] == MTYPES[tlsa['mtype']](pub_key).hexdigest():
           return True
 
     elif tlsa['usage'] == 1 or tlsa['usage'] == 3: # End Entity
       if tlsa['selector'] == 0:
-        if tlsa['data'] == mTypes[tlsa['mtype']](certs[0]).digest().hex():
+        if tlsa['data'] == MTYPES[tlsa['mtype']](certs[0]).hexdigest():
           return True
       else:
         pub_key = extract_pub_key(certs[0])
-        if tlsa['data'] == mTypes[tlsa['mtype']](pub_key).digest().hex():
+        if tlsa['data'] == MTYPES[tlsa['mtype']](pub_key).hexdigest():
           return True
 
   return False
 
-  
+def printSpki(certs):
+  for cert in certs:
+    components = crypto.load_certificate(crypto.FILETYPE_ASN1, cert).get_subject().get_components()
+    print(' '.join([entity.decode('UTF-8') + '=' + name.decode('UTF-8') for entity,name in components]))
+
+    derSeq = DerSequence()
+    derSeq.decode(cert)
+    tbsCert = DerSequence()
+    tbsCert.decode(derSeq[0])
+
+    if args.hash == 'none':
+      print("\t" + MTYPES[0](extract_pub_key(cert)).hexdigest())
+    elif args.hash == 'sha256':
+      print("\t" + MTYPES[1](extract_pub_key(cert)).hexdigest())
+    elif args.hash == 'sha512':
+      print("\t" + MTYPES[2](extract_pub_key(cert)).hexdigest())
+
 ###################
 # BEGIN EXECUTION #
 ###################
@@ -156,7 +186,12 @@ ap = argparse.ArgumentParser(description='Test HTTPS DANE validation for a domai
 ap.add_argument('domain', nargs=1, help='Domain under test')
 ap.add_argument('-v', '--verbose', action='store_true', dest='verbose', help='Verbose output')
 ap.add_argument('-vv', '--very_verbose', action='store_true', dest='very_verbose', help='Very Verbose output')
+ap.add_argument('-s', '--spki', action='store_true', dest='spki', help='Print hash of SubjectPublicKeyInfo for each certificate')
+ap.add_argument('-ha', '--hash', dest='hash', default='sha256', choices=['none', 'sha256', 'sha512'], help='Hash algorithm to use for SPKI, default:sha256')
 args = ap.parse_args()
+
+if args.very_verbose:
+  args.verbose = True
 
 dom = args.domain[0].strip()
 
@@ -180,6 +215,9 @@ certs = get_certs(dom)
 if len(certs) == 0:
   print("No certificates found for " + dom)
   sys.exit(0)
+
+if args.spki:
+  printSpki(certs)
 
 tlsa_rrs = get_tlsa(dom)
 if tlsa_rrs:
