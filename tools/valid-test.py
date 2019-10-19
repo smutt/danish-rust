@@ -158,22 +158,30 @@ def validate(certs, tlsa_rrs, verbose=False):
 
   return False
 
-def printSpki(certs):
+def printSpkiHash(certs):
   for cert in certs:
     components = crypto.load_certificate(crypto.FILETYPE_ASN1, cert).get_subject().get_components()
     print(' '.join([entity.decode('UTF-8') + '=' + name.decode('UTF-8') for entity,name in components]))
 
-    derSeq = DerSequence()
-    derSeq.decode(cert)
-    tbsCert = DerSequence()
-    tbsCert.decode(derSeq[0])
+    if args.hash == 'none':
+      print("SPKI \t" + MTYPES[0](extract_pub_key(cert)).hexdigest())
+    elif args.hash == 'sha256':
+      print("SPKI \t" + MTYPES[1](extract_pub_key(cert)).hexdigest())
+    elif args.hash == 'sha512':
+      print("SPKI \t" + MTYPES[2](extract_pub_key(cert)).hexdigest())
+
+def printX509Hash(certs):
+  for cert in certs:
+    components = crypto.load_certificate(crypto.FILETYPE_ASN1, cert).get_subject().get_components()
+    print(' '.join([entity.decode('UTF-8') + '=' + name.decode('UTF-8') for entity,name in components]))
 
     if args.hash == 'none':
-      print("\t" + MTYPES[0](extract_pub_key(cert)).hexdigest())
+      print("X509 \t" + MTYPES[0](cert).hexdigest())
     elif args.hash == 'sha256':
-      print("\t" + MTYPES[1](extract_pub_key(cert)).hexdigest())
+      print("X509 \t" + MTYPES[1](cert).hexdigest())
     elif args.hash == 'sha512':
-      print("\t" + MTYPES[2](extract_pub_key(cert)).hexdigest())
+      print("X509 \t" + MTYPES[2](cert).hexdigest())
+
 
 ###################
 # BEGIN EXECUTION #
@@ -184,7 +192,8 @@ ap.add_argument('domain', nargs=1, help='Domain under test')
 ap.add_argument('-v', '--verbose', action='store_true', dest='verbose', help='Verbose output')
 ap.add_argument('-vv', '--very_verbose', action='store_true', dest='very_verbose', help='Very Verbose output')
 ap.add_argument('-s', '--spki', action='store_true', dest='spki', help='Print hash of SubjectPublicKeyInfo for each certificate')
-ap.add_argument('-ha', '--hash', dest='hash', default='sha256', choices=['none', 'sha256', 'sha512'], help='Hash algorithm to use for SPKI, default:sha256')
+ap.add_argument('-x', '--x509', action='store_true', dest='x509', help='Print hash of DER X.509 for each certificate')
+ap.add_argument('-ha', '--hash', dest='hash', default='sha256', choices=['none', 'sha256', 'sha512'], help='Hash algorithm to use, default:sha256')
 args = ap.parse_args()
 
 if args.very_verbose:
@@ -213,9 +222,6 @@ if len(certs) == 0:
   print("No certificates found for " + dom)
   sys.exit(0)
 
-if args.spki:
-  printSpki(certs)
-
 tlsa_rrs = get_tlsa(dom)
 if tlsa_rrs:
   if args.verbose:
@@ -229,5 +235,11 @@ if tlsa_rrs:
 
 else:
   print("No TLSA for " + dom)
+
+if args.spki:
+  printSpkiHash(certs)
+
+if args.x509:
+  printX509Hash(certs)
 
 sys.exit(0)
