@@ -21,9 +21,6 @@ class Dummy: # A class full of dummies
   def __init__(self, y):
     self.x = y
 
-  def dummy(self):
-    return self.x
-
   def hexdigest(self):
     return ''.join([hex(byte).split('0x')[1] for byte in self.x])
 
