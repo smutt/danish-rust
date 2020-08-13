@@ -864,6 +864,12 @@ fn main() {
         _ => cease(&format!("Invalid interface {:?}", cli_opts.iface)),
     }
 
+    // Check if we can capture promiscuously, will fail if not root
+    match Capture::from_device(Opt::from_args().iface.as_str()).unwrap().promisc(true).rfmon(false).open() {
+        Ok(_) => debug!("test success, {:?} opened in promisc mode", Opt::from_args().iface.as_str()),
+        _ => cease(&(format!("Unable to open {:?} in promisc mode. Make sure you are root.", Opt::from_args().iface.as_str()))),
+    }
+
     // Setup iptables
     match iptables::new(false) {
         Err(_) => cease(&(format!("FATAL iptables error"))),
