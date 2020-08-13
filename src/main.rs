@@ -14,8 +14,9 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use tls_parser::tls;
 use tls_parser::tls_extensions;
-use resolv::{Resolver, Class, RecordType};
-use resolv::record::TLSA;
+use trust_dns_resolver::Resolver;
+use trust_dns_client::rr::rdata::TLSA;
+use trust_dns_client::rr::rdata::tlsa::{CertUsage, Selector, Matching};
 use rand::{Rng, thread_rng};
 use rand::distributions::Alphanumeric;
 use sha2::{Sha256, Sha512, Digest};
@@ -70,7 +71,7 @@ enum SniParseError {
 struct ClientCacheEntry { // Key in hashmap is from derive_cache_key()
     ts: SystemTime, // Last touched timestamp
     sni: String, // SNI
-    tlsa: Option<Vec<TLSA>>, // DNS TLSA RRSET
+    tlsa_rrset: Option<Vec<TLSA>>, // DNS TLSA RRSET
     response: bool, // Have we queried and gotten a response yet?
     rpz_blocked: bool, // True if RPZ checking failed and ACL was installed
     stale: bool, // Entry can be deleted at next cleanup
@@ -300,13 +301,13 @@ fn parse_server_hello(acl_cache: &Arc<RwLock<HashMap::<String, AclCacheEntry>>>,
 // TODO: Rewrite using async/await once it's final
 fn dns_lookup_tlsa(client_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>, key: String) {
     thread::spawn(move || {
-        let qname = "_443._tcp.".to_owned() + &client_cache.read().get(&key).unwrap().sni.clone();
-        let mut resolver = Resolver::new().unwrap();
-        match resolver.query(&qname.into_bytes(), Class::IN, RecordType::TLSA) {
-            Ok(mut response) => {
+        let qname = "_443._tcp.".to_owned() + &client_cache.read().get(&key).unwrap().sni.clone() + ".";
+        let resolver = Resolver::from_system_conf().unwrap();
+        match resolver.tlsa_lookup(qname) {
+            Ok(response) => {
                 if let Some(entry) = client_cache.write().get_mut(&key) {
                     entry.response = true;
-                    entry.tlsa = Some(response.answers::<TLSA>().map(|t| t.data).collect::<Vec<_>>());
+                    entry.tlsa_rrset = Some(response.iter().map(|t| t.to_owned()).collect::<Vec<_>>());
                     entry.ts = SystemTime::now();
                 }else{
                     panic!("Failed to update client_cache");
@@ -344,9 +345,9 @@ fn handle_validation(acl_cache: Arc<RwLock<HashMap<String, AclCacheEntry>>>,
         let mut ii = DNS_TIMEOUT;
         loop {
             if cl_cache.read().get(&key).unwrap().response == true {
-                match cl_cache.read().get(&key).unwrap().tlsa {
-                    Some(ref tlsa) => {
-                        if validate_tlsa(tlsa, &cert_chain) {
+                match cl_cache.read().get(&key).unwrap().tlsa_rrset {
+                    Some(ref tlsa_rrset) => {
+                        if validate_tlsa(tlsa_rrset, &cert_chain) {
                             debug!("Valid TLSA for {:?}", sni);
                         }else{
                             debug!("Invalid TLSA for {:?}", sni);
@@ -417,9 +418,9 @@ fn validate_tlsa(tlsa_rrset: &Vec<TLSA>, cert_chain: &Vec<Vec<u8>>) -> bool {
     //debug!("Entered validate_tlsa() tlsa_rrset: {:?}", tlsa_rrset);
     for tlsa in tlsa_rrset {
         let mut certs: Vec<Vec<u8>> = cert_chain.clone();
-        match tlsa.selector {
-            0 => {},
-            1 => {
+        match tlsa.selector() {
+            Selector::Full => {},
+            Selector::Spki => {
                 certs.clear();
                 for cc in cert_chain.iter() {
                     match X509::from_der(&cc) {
@@ -453,74 +454,74 @@ fn validate_tlsa(tlsa_rrset: &Vec<TLSA>, cert_chain: &Vec<Vec<u8>>) -> bool {
             }
         }
 
-        match tlsa.usage {
-            0 => {
-                match tlsa.matching_type {
-                    0 => {
+        match tlsa.cert_usage() {
+            CertUsage::CA => {
+                match tlsa.matching() {
+                    Matching::Raw => {
                         for cert in certs {
-                            if tlsa.data == cert.as_slice() {
+                            if tlsa.cert_data() == cert.as_slice() {
                                 return true;
                             }
                         }
                     }
-                    1 => {
+                    Matching::Sha256 => {
                         for cert in certs {
-                            if tlsa.data == Sha256::digest(&cert).as_slice() {
+                            if tlsa.cert_data() == Sha256::digest(&cert).as_slice() {
                                 return true;
                             }
                         }
                     }
-                    2 => {
+                    Matching::Sha512 => {
                         for cert in certs {
-                            if tlsa.data == Sha512::digest(&cert).as_slice() {
+                            if tlsa.cert_data() == Sha512::digest(&cert).as_slice() {
                                 return true;
                             }
                         }
                     }
-                    _ => debug!("Unsupported TLSA::matching_type {:?}", tlsa.matching_type),
+                    _ => debug!("Unsupported TLSA::matching {:?}", tlsa.matching()),
                 }
             }
-            1 | 3 => {
-                match tlsa.matching_type {
-                    0 => {
-                        if tlsa.data == certs[0].as_slice() {
+            CertUsage::Service | CertUsage::DomainIssued => {
+                match tlsa.matching() {
+                    Matching::Raw => {
+                        if tlsa.cert_data() == certs[0].as_slice() {
                             return true;
                         }
                     }
-                    1 => {
-                        if tlsa.data == Sha256::digest(&certs[0]).as_slice(){
+                    Matching::Sha256 => {
+                        if tlsa.cert_data() == Sha256::digest(&certs[0]).as_slice(){
                             return true;
                         }
                     }
-                    2 => {
-                        if tlsa.data == Sha512::digest(&certs[0]).as_slice() {
+                    Matching::Sha512 => {
+                        if tlsa.cert_data() == Sha512::digest(&certs[0]).as_slice() {
                             return true;
                         }
                     }
-                    _ => debug!("Unsupported TLSA::matching_type {:?}", tlsa.matching_type),
+                    _ => debug!("Unsupported TLSA::matching {:?}", tlsa.matching()),
                 }
             }
-            2 => {
-                match tlsa.matching_type {
-                    0 => {
-                        if tlsa.data == certs[certs.len()-1].as_slice() {
+            CertUsage::TrustAnchor => {
+                match tlsa.matching() {
+                    Matching::Raw => {
+                        if tlsa.cert_data() == certs[certs.len()-1].as_slice() {
                             return true;
                         }
                     }
-                    1 => {
-                        if tlsa.data == Sha256::digest(&certs[certs.len()-1]).as_slice() {
+                    Matching::Sha256 => {
+                        if tlsa.cert_data() == Sha256::digest(&certs[certs.len()-1]).as_slice() {
                             return true;
                         }
                     }
-                    2 => {
-                        if tlsa.data == Sha512::digest(&certs[certs.len()-1]).as_slice() {
+                    Matching::Sha512 => {
+                        if tlsa.cert_data() == Sha512::digest(&certs[certs.len()-1]).as_slice() {
                             return true;
                         }
                     }
-                    _ => debug!("Unsupported TLSA::matching_type {:?}", tlsa.matching_type),
+                    _ => debug!("Unsupported TLSA::matching_type {:?}", tlsa.matching()),
                 }
             }
-            _ => debug!("Unsupported TLSA::usage {:?}", tlsa.usage),
+            _ => debug!("Unsupported TLSA::usage {:?}", tlsa.cert_usage()),
         }
     }
     return false;
@@ -532,12 +533,12 @@ fn handle_rpz(acl_cache: Arc<RwLock<HashMap::<String, AclCacheEntry>>>,
               client_cache: Arc<RwLock<HashMap<String, ClientCacheEntry>>>, key: String) {
 
     thread::spawn(move || {
-        let sni = client_cache.read().get(&key).unwrap().sni.clone();
-        let mut resolver = Resolver::new().unwrap();
-        match resolver.query(&sni.clone().into_bytes(), Class::IN, RecordType::A) {
+        let sni:String = client_cache.read().get(&key).unwrap().sni.clone() + ".";
+        let resolver = Resolver::from_system_conf().unwrap();
+        match resolver.ipv4_lookup(sni.as_str()) {
             Ok(_) => { },
             Err(_) => {
-                match resolver.query(&sni.clone().into_bytes(), Class::IN, RecordType::AAAA) {
+                match resolver.ipv6_lookup(sni.as_str()) {
                     Ok(_) => { },
                     Err(_) => {
                         if let Some(cl_entry) = client_cache.write().get_mut(&key) {
@@ -1013,7 +1014,7 @@ fn main() {
                                         ClientCacheEntry {
                                             ts: SystemTime::now(),
                                             sni: sni.clone(),
-                                            tlsa: None,
+                                            tlsa_rrset: None,
                                             response: false,
                                             rpz_blocked: false,
                                             stale: false,
@@ -1159,7 +1160,7 @@ fn main() {
                                                 client_cache_v6.write().insert(key.clone(), ClientCacheEntry {
                                                     ts: SystemTime::now(),
                                                     sni: sni.clone(),
-                                                    tlsa: None,
+                                                    tlsa_rrset: None,
                                                     response: false,
                                                     rpz_blocked: false,
                                                     stale: false,

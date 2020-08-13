@@ -16,7 +16,8 @@ env_logger = "^0.6.1"
 parking_lot = "^0.8.0"
 sha2 = "0.8.0"
 rand = "^0.7.0"
-resolv = "^0.1.5"
+trust-dns-resolver = { path = "../trust-dns/crates/resolver" }
+trust-dns-client = { path = "../trust-dns/crates/client" }
 simpath = "^1.3.0"
 ipaddress = "^0.1.2"
 structopt = {version = "^0.2", default-features = false }
