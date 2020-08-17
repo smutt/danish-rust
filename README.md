@@ -9,8 +9,8 @@ Danish is a daemon that listens for HTTPS TLS handshake traffic and captures the
 If the certificates and DNS TLSA records do NOT match, iptables/ip6tables ACLs are installed to block user traffic to the offending website. ACLs are installed to both blackhole the immediate TCP traffic and prevent any further attempts at users connecting to the offending website. Users are then prevented from connecting to the offending website for the TTL of the relevant DNS TLSA RR.
 
 This is a full rewrite of
-[Python Danish](https://github.com/smutt/danish) in Rust. For the version of Danish currently in the OpenWRT packaging library
-go to [Python Danish](https://github.com/smutt/danish)
+[Python Danish](https://github.com/smutt/danish) in Rust. For the
+Python version of Danish go to [Python Danish](https://github.com/smutt/danish)
 
 ## Supported Protocols and Versions
 Danish currently supports TLS 1.0 - 1.2, IPv4/IPv6.
@@ -33,7 +33,6 @@ danish man page somewhere on your system and you're good to go.
 
 **Danish requires the following development libraries for
 compilation.**
-* lib-resolv
 * lib-pcap
 * lib-pthread
 
