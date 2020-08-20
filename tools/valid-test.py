@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 
-# Copyright (c) 2019, Andrew McConachie <andrew@depht.com>
+# Copyright (c) 2019, 2020, Andrew McConachie <andrew@depht.com>
 # All rights reserved.
 
 import sys
 import os
-import urllib.request
+import urllib3.request
+import requests.packages.urllib3.util.connection as urllib3_con
 import argparse
 import socket
 import dns.resolver
@@ -38,18 +39,18 @@ MTYPES = { # Possible RFC 6698 matching types
 # GLOBAL FUNCTIONS #
 ####################
 def fetch_index(host):
-  try:
-    urllib.request.urlopen("https://" + host + "/index.html", timeout=HTTPS_TIMEOUT)
+  https = urllib3.PoolManager()
+  if args.ipv4: # A disgusting monkey patch hack
+    urllib3_con.allowed_gai_family = lambda: socket.AF_INET
+  elif args.ipv6:
+    urllib3_con.allowed_gai_family = lambda: socket.AF_INET6
 
-  except urllib.error.URLError as e:
+  try:
+    https.request('GET', "https://" + host + "/index.html", timeout=HTTPS_TIMEOUT)
+
+  except e:
+    print(str(e))
     return False
-    pass
-  except urllib.error.HTTPError:
-    return False
-    pass
-  except:
-    return False
-    pass
   else:
     return True
 
@@ -59,7 +60,13 @@ def get_certs(host, port=443):
   certs = []
   try:
     ctx = SSL.Context(SSL.SSLv23_METHOD)
-    sock = socket.create_connection((host, port))
+    if args.ipv4:
+      sock = socket.create_connection((get_a(host), port))
+    elif args.ipv6:
+      sock = socket.create_connection((get_aaaa(host), port))
+    else:
+      sock = socket.create_connection((host, port))
+
     tls = SSL.Connection(ctx, sock)
     tls.set_connect_state()
     tls.set_tlsext_host_name(host.encode())
@@ -86,7 +93,7 @@ def get_a(host):
   if len(resp.rrset) < 1:
     return False
   else:
-    return resp.rrset[0]
+    return str(resp.rrset[0])
 
 def get_aaaa(host):
   d = dns.resolver.Resolver()
@@ -98,7 +105,7 @@ def get_aaaa(host):
   if len(resp.rrset) < 1:
     return False
   else:
-    return resp.rrset[0]
+    return str(resp.rrset[0])
 
 def get_tlsa(host, port=443, trans='tcp'):
   d = dns.resolver.Resolver()
@@ -136,25 +143,28 @@ def extract_pub_key(der):
 
   return tbsCertificate[6]
 
-def validate(certs, tlsa_rrs, verbose=False):
+def validate(certs, tlsa_rrs):
   for tlsa in tlsa_rrs:
-    if tlsa['usage'] == 0 or tlsa['usage'] == 2: # Trust Anchor
-      if tlsa['selector'] == 0:
-        if tlsa['data'] == MTYPES[tlsa['mtype']](certs[-1]).hexdigest():
-          return True
-      else:
-        pub_key = extract_pub_key(certs[-1])
-        if tlsa['data'] == MTYPES[tlsa['mtype']](pub_key).hexdigest():
+    if tlsa['selector'] == 0:
+      certs = [cc for cc in certs]
+    elif tlsa['selector'] == 1:
+      certs = [extract_pub_key(cc) for cc in certs]
+    else:
+      print("Invalid TLSA selector:" + tlsa['selector'])
+      continue
+
+    if tlsa['usage'] == 0: # CA constraint (any)
+      for cc in certs:
+        if tlsa['data'] == MTYPES[tlsa['mtype']](cc).hexdigest():
           return True
 
-    elif tlsa['usage'] == 1 or tlsa['usage'] == 3: # End Entity
-      if tlsa['selector'] == 0:
-        if tlsa['data'] == MTYPES[tlsa['mtype']](certs[0]).hexdigest():
-          return True
-      else:
-        pub_key = extract_pub_key(certs[0])
-        if tlsa['data'] == MTYPES[tlsa['mtype']](pub_key).hexdigest():
-          return True
+    elif tlsa['usage'] == 1 or tlsa['usage'] == 3: # End Entity (0)
+      if tlsa['data'] == MTYPES[tlsa['mtype']](certs[0]).hexdigest():
+        return True
+
+    elif tlsa['usage'] == 2: # Trust Anchor (-1)
+      if tlsa['data'] == MTYPES[tlsa['mtype']](certs[-1]).hexdigest():
+        return True
 
   return False
 
@@ -194,6 +204,9 @@ ap.add_argument('-vv', '--very_verbose', action='store_true', dest='very_verbose
 ap.add_argument('-s', '--spki', action='store_true', dest='spki', help='Print hash of SubjectPublicKeyInfo for each certificate')
 ap.add_argument('-x', '--x509', action='store_true', dest='x509', help='Print hash of DER X.509 for each certificate')
 ap.add_argument('-ha', '--hash', dest='hash', default='sha256', choices=['none', 'sha256', 'sha512'], help='Hash algorithm to use, default:sha256')
+ap.add_argument('-4', dest='ipv4', default=False, action='store_true', help='Force IPv4')
+ap.add_argument('-6', dest='ipv6', default=False, action='store_true', help='Force IPv6')
+
 args = ap.parse_args()
 
 if args.very_verbose:
@@ -201,12 +214,32 @@ if args.very_verbose:
 
 dom = args.domain[0].strip()
 
-if get_a(dom) or get_aaaa(dom):
-  if args.verbose:
-    print("Success fetching A/AAAA for " + dom)
-else:
-  print("Bad Domain " + dom)
+if args.ipv4 and args.ipv6:
+  print("Cannot force both IPv4 and IPv6")
   sys.exit(1)
+
+# Test querying A/AAAA
+if args.ipv4:
+  if get_a(dom):
+    if args.verbose:
+      print("Success fetching A for " + dom)
+  else:
+    print("Bad Domain " + dom)
+    sys.exit(1)
+elif args.ipv6:
+  if get_aaaa(dom):
+    if args.verbose:
+      print("Success fetching AAAA for " + dom)
+  else:
+    print("Bad Domain " + dom)
+    sys.exit(1)
+else:
+  if get_a(dom) or get_aaaa(dom):
+    if args.verbose:
+      print("Success fetching A/AAAA for " + dom)
+  else:
+    print("Bad Domain " + dom)
+    sys.exit(1)
 
 if fetch_index(dom):
   if args.verbose:
@@ -214,14 +247,15 @@ if fetch_index(dom):
 else:
   print("Failed fetching https://" + dom + "/index.html")
 
+# Fetch the cert chain
 if args.verbose:
   print("Fetching certificate chain for " + dom)
 certs = get_certs(dom)
-
 if len(certs) == 0:
   print("No certificates found for " + dom)
   sys.exit(0)
 
+# Fetch the TLSA RRs
 tlsa_rrs = get_tlsa(dom)
 if tlsa_rrs:
   if args.verbose:
@@ -232,7 +266,6 @@ if tlsa_rrs:
     print("Valid TLSA for " + dom)
   else:
     print("No valid TLSA for " + dom)
-
 else:
   print("No TLSA for " + dom)
 
