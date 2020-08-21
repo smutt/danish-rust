@@ -7,6 +7,7 @@ import sys
 import os
 import urllib3.request
 import requests.packages.urllib3.util.connection as urllib3_con
+import urllib3.util as urllib3_util
 import argparse
 import socket
 import dns.resolver
@@ -28,7 +29,7 @@ class Dummy: # A class full of dummies
 #############
 # CONSTANTS #
 #############
-HTTPS_TIMEOUT = 10 # Timeout in seconds for HTTPS GET
+TIMEOUT = 2 # Timeout in seconds for HTTPS GET
 MTYPES = { # Possible RFC 6698 matching types
   0: Dummy,
   1: hashlib.sha256,
@@ -39,34 +40,34 @@ MTYPES = { # Possible RFC 6698 matching types
 # GLOBAL FUNCTIONS #
 ####################
 def fetch_index(host):
-  https = urllib3.PoolManager()
+  tout = urllib3_util.Timeout(connect=float(TIMEOUT))
+  ret = urllib3_util.Retry(total=2)
+  https = urllib3.PoolManager(timeout=tout, retries=ret)
   if args.ipv4: # A disgusting monkey patch hack
     urllib3_con.allowed_gai_family = lambda: socket.AF_INET
   elif args.ipv6:
     urllib3_con.allowed_gai_family = lambda: socket.AF_INET6
 
   try:
-    https.request('GET', "https://" + host + "/index.html", timeout=HTTPS_TIMEOUT)
-
-  except e:
-    print(str(e))
+    https.request('GET', "https://" + host + "/index.html")
+  except:
     return False
   else:
     return True
 
 # https://stackoverflow.com/questions/51039393/get-or-build-pem-certificate-chain-in-python
-# TODO: Need to return the whole certificate chain and not just one
 def get_certs(host, port=443):
   certs = []
   try:
     ctx = SSL.Context(SSL.SSLv23_METHOD)
     if args.ipv4:
-      sock = socket.create_connection((get_a(host), port))
+      sock = socket.create_connection((get_a(host), port), timeout=TIMEOUT)
     elif args.ipv6:
-      sock = socket.create_connection((get_aaaa(host), port))
+      sock = socket.create_connection((get_aaaa(host), port), timeout=TIMEOUT)
     else:
-      sock = socket.create_connection((host, port))
+      sock = socket.create_connection((host, port), timeout=TIMEOUT)
 
+    sock.settimeout(None)
     tls = SSL.Connection(ctx, sock)
     tls.set_connect_state()
     tls.set_tlsext_host_name(host.encode())
@@ -76,11 +77,10 @@ def get_certs(host, port=443):
 
     certs = tls.get_peer_cert_chain()
   except:
-    sock.close()
-    return certs
-  finally:
-    sock.close()
+    print("Failed to establish TLS connection to https://" + host + "/")
+    return []
 
+  sock.close()
   return [crypto.dump_certificate(crypto.FILETYPE_ASN1, cert) for cert in certs]
 
 def get_a(host):
